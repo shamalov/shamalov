@@ -4,24 +4,46 @@ import { THEMES } from "./themes.mjs";
 
 // Layout
 const PADDING = 15;
-const PADDLE_WIDTH = 75;
-const PADDLE_HEIGHT = 10;
-const PADDLE_RADIUS = 5;
+const PADDLE_WIDTH = 50;
+const PADDLE_HEIGHT = 6;
+const PADDLE_RADIUS = 3;
+const PADDLE_WIDE_SCALE = 1.65;
 const PADDLE_BRICK_GAP = 100;
-const BALL_RADIUS = 8;
+const BALL_RADIUS = 5;
 const BRICK_SIZE = 12;
 const BRICK_GAP = 3;
 const BRICK_RADIUS = 3;
+const POWERUP_SIZE = 9;
+const POWERUP_FALL_SPEED = 2.2;
 
 // Simulation
-const BALL_SPEED = 9;
+const BALL_SPEED = 8;
+const FAST_SPEED = 11;
+const SLOW_SPEED = 6;
 const SUB_STEPS = 6;
 const SECONDS_PER_FRAME = 1 / 30;
-const FRAME_SAMPLE = 2; // sample every N simulation frames for smaller SVGs
+const FRAME_SAMPLE = 4;
 const MAX_FRAMES = 40000;
-const MIN_BOUNCE_ANGLE = 0.35; // radians (~20°) — prevents vertical/horizontal trap loops
+const MAX_BALLS = 4;
+const MIN_BOUNCE_ANGLE = 0.35;
 const MIN_VX_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
 const MIN_VY_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
+const WIDE_DURATION = 360;
+const FAST_DURATION = 240;
+const SLOW_DURATION = 240;
+
+/** @typedef {'multi' | 'wide' | 'fast' | 'slow'} PowerUpType */
+
+/** @type {Record<PowerUpType, { label: string, color: string }>} */
+const POWERUP_META = {
+  multi: { label: "●●", color: "#f7ff00" },
+  wide: { label: "↔", color: "#58A6FF" },
+  fast: { label: "»", color: "#ff6b35" },
+  slow: { label: "«", color: "#b388ff" },
+};
+
+/** @type {PowerUpType[]} */
+const POWERUP_TYPES = ["multi", "wide", "fast", "slow"];
 
 /**
  * @param {string} userName
@@ -37,7 +59,6 @@ async function fetchContributions(userName, githubToken) {
               contributionDays {
                 contributionLevel
                 contributionCount
-                color
               }
             }
           }
@@ -54,19 +75,13 @@ async function fetchContributions(userName, githubToken) {
     body: JSON.stringify({ query, variables: { userName } }),
   });
 
-  if (!res.ok) {
-    throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
-  }
+  if (!res.ok) throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
 
   const json = await res.json();
-  if (json.errors) {
-    throw new Error(`GitHub GraphQL error: ${JSON.stringify(json.errors)}`);
-  }
+  if (json.errors) throw new Error(`GitHub GraphQL error: ${JSON.stringify(json.errors)}`);
 
-  const weeks =
-    json.data.user.contributionsCollection.contributionCalendar.weeks;
-
-  /** @type {(import("./themes.mjs").ColorPalette | { level: number, contributionCount: number } | null)[][]} */
+  const weeks = json.data.user.contributionsCollection.contributionCalendar.weeks;
+  /** @type {({ level: number, contributionCount: number } | null)[][]} */
   const days = [];
 
   for (let c = 0; c < weeks.length; c++) {
@@ -79,7 +94,6 @@ async function fetchContributions(userName, githubToken) {
         (day.contributionLevel === "SECOND_QUARTILE" && 2) ||
         (day.contributionLevel === "FIRST_QUARTILE" && 1) ||
         0;
-
       days[c][r] = { level, contributionCount: day.contributionCount };
     }
   }
@@ -87,40 +101,24 @@ async function fetchContributions(userName, githubToken) {
   return days;
 }
 
-/**
- * @param {number} vx
- * @param {number} vy
- * @param {number} speed
- */
 function normalizeVelocity(vx, vy, speed) {
   const mag = Math.hypot(vx, vy);
   if (mag < 1e-6) return { vx: 0, vy: -speed };
   return { vx: (vx / mag) * speed, vy: (vy / mag) * speed };
 }
 
-/**
- * Keep speed constant while ensuring the ball never travels too vertically
- * or too horizontally (either causes infinite bounce loops).
- * @param {number} vx
- * @param {number} vy
- * @param {number} speed
- * @param {number} [biasX=0] deterministic horizontal sign when vx is ~0
- */
 function clampVelocity(vx, vy, speed, biasX = 0) {
   let nvx = vx;
   let nvy = vy;
-
   const minVx = speed * MIN_VX_RATIO;
   const minVy = speed * MIN_VY_RATIO;
 
-  // Prevent vertical trap loops (vx ≈ 0)
   if (Math.abs(nvx) < minVx) {
     const sign = nvx !== 0 ? Math.sign(nvx) : (biasX !== 0 ? Math.sign(biasX) : 1);
     nvx = sign * minVx;
     nvy = Math.sign(nvy || -1) * Math.sqrt(speed * speed - nvx * nvx);
   }
 
-  // Prevent horizontal trap loops (vy ≈ 0)
   if (Math.abs(nvy) < minVy) {
     const sign = nvy !== 0 ? Math.sign(nvy) : -1;
     nvy = sign * minVy;
@@ -130,17 +128,6 @@ function clampVelocity(vx, vy, speed, biasX = 0) {
   return normalizeVelocity(nvx, nvy, speed);
 }
 
-/**
- * @param {number} cx
- * @param {number} cy
- * @param {number} r
- * @param {number} rx
- * @param {number} ry
- * @param {number} rw
- * @param {number} rh
- * @param {number} prevCx
- * @param {number} prevCy
- */
 function circleRectCollisionSide(cx, cy, r, rx, ry, rw, rh, prevCx, prevCy) {
   const closestX = Math.max(rx, Math.min(cx, rx + rw));
   const closestY = Math.max(ry, Math.min(cy, ry + rh));
@@ -171,8 +158,10 @@ function circleRectCollisionSide(cx, cy, r, rx, ry, rw, rh, prevCx, prevCy) {
 }
 
 /**
- * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean }} Brick
- * @typedef {{ ballX: number, ballY: number, paddleX: number, bricks: ("visible" | "hidden")[] }} FrameState
+ * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean, index: number }} Brick
+ * @typedef {{ x: number, y: number, vx: number, vy: number, speed: number }} Ball
+ * @typedef {{ x: number, y: number, type: PowerUpType, id: number }} PowerUp
+ * @typedef {{ paddleX: number, paddleWidth: number, balls: {x:number,y:number}[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
  */
 
 /**
@@ -184,132 +173,199 @@ function circleRectCollisionSide(cx, cy, r, rx, ry, rw, rh, prevCx, prevCy) {
  * @param {number} seed
  */
 function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks, seed) {
-  let ballX = canvasWidth / 2;
-  let ballY = canvasHeight - 30;
-
   const launchAngle = -Math.PI / 4 + ((seed % 7) - 3) * 0.04;
-  let ballVx = BALL_SPEED * Math.cos(launchAngle);
-  let ballVy = BALL_SPEED * Math.sin(launchAngle);
+  /** @type {Ball[]} */
+  let balls = [{
+    x: canvasWidth / 2,
+    y: canvasHeight - 24,
+    vx: BALL_SPEED * Math.cos(launchAngle),
+    vy: BALL_SPEED * Math.sin(launchAngle),
+    speed: BALL_SPEED,
+  }];
 
-  const simulatedBricks = bricks.map((b) => ({ ...b }));
+  const simulatedBricks = bricks.map((b, i) => ({ ...b, index: i }));
   /** @type {FrameState[]} */
   const frameHistory = [];
+  /** @type {PowerUp[]} */
+  let powerUps = [];
+  let powerUpId = 0;
   let paddleX = (canvasWidth - PADDLE_WIDTH) / 2;
+  let paddleWidth = PADDLE_WIDTH;
+  let wideUntil = 0;
+  let speedMod = /** @type {{ type: 'fast'|'slow'|null, until: number }} */ ({ type: null, until: 0 });
   let frame = 0;
   let verticalTrapFrames = 0;
+  let brokenCount = 0;
 
   const breakable = (/** @type {Brick} */ b) =>
     b.status === "visible" && (!enableGhostBricks || b.hasCommit);
 
-  while (
-    simulatedBricks.some(breakable) &&
-    frame < MAX_FRAMES
-  ) {
-    // Predictive paddle — lead the ball slightly for smoother tracking
-    const targetX = ballX + ballVx * 3 - PADDLE_WIDTH / 2;
-    const clampedTarget = Math.max(
-      PADDING,
-      Math.min(canvasWidth - PADDING - PADDLE_WIDTH, targetX),
-    );
-    paddleX += (clampedTarget - paddleX) * 0.18;
+  const getBallSpeed = (/** @type {Ball} */ ball) => {
+    if (speedMod.type === "fast" && frame < speedMod.until) return FAST_SPEED;
+    if (speedMod.type === "slow" && frame < speedMod.until) return SLOW_SPEED;
+    return ball.speed;
+  };
 
-    const stepVx = ballVx / SUB_STEPS;
-    const stepVy = ballVy / SUB_STEPS;
+  const spawnPowerUp = (/** @type {Brick} */ brick) => {
+    if (!brick.hasCommit) return;
+    brokenCount++;
+    if ((brick.index + seed + brokenCount) % 10 !== 0) return;
+    const type = POWERUP_TYPES[(brick.index + seed + brokenCount) % POWERUP_TYPES.length];
+    powerUps.push({
+      x: brick.x + BRICK_SIZE / 2,
+      y: brick.y + BRICK_SIZE / 2,
+      type,
+      id: powerUpId++,
+    });
+  };
+
+  const applyPowerUp = (/** @type {PowerUpType} */ type) => {
+    if (type === "multi" && balls.length < MAX_BALLS) {
+      const src = balls[0];
+      const angles = [-0.5, 0.5];
+      for (const a of angles) {
+        if (balls.length >= MAX_BALLS) break;
+        const speed = getBallSpeed(src);
+        balls.push({
+          x: paddleX + paddleWidth / 2,
+          y: paddleY - BALL_RADIUS - 2,
+          vx: speed * Math.sin(a),
+          vy: -speed * Math.cos(a),
+          speed: BALL_SPEED,
+        });
+      }
+    } else if (type === "wide") {
+      wideUntil = frame + WIDE_DURATION;
+    } else if (type === "fast") {
+      speedMod = { type: "fast", until: frame + FAST_DURATION };
+      for (const b of balls) {
+        const v = clampVelocity(b.vx, b.vy, FAST_SPEED, b.vx);
+        b.vx = v.vx; b.vy = v.vy;
+      }
+    } else if (type === "slow") {
+      speedMod = { type: "slow", until: frame + SLOW_DURATION };
+      for (const b of balls) {
+        const v = clampVelocity(b.vx, b.vy, SLOW_SPEED, b.vx);
+        b.vx = v.vx; b.vy = v.vy;
+      }
+    }
+  };
+
+  const respawnBall = () => {
+    const angle = -Math.PI / 4;
+    balls = [{
+      x: paddleX + paddleWidth / 2,
+      y: paddleY - BALL_RADIUS - 2,
+      vx: BALL_SPEED * Math.cos(angle),
+      vy: BALL_SPEED * Math.sin(angle),
+      speed: BALL_SPEED,
+    }];
+  };
+
+  while (simulatedBricks.some(breakable) && frame < MAX_FRAMES) {
+    paddleWidth = frame < wideUntil ? PADDLE_WIDTH * PADDLE_WIDE_SCALE : PADDLE_WIDTH;
+
+    const leadBall = balls[0];
+    const targetX = (leadBall?.x ?? canvasWidth / 2) + (leadBall?.vx ?? 0) * 3 - paddleWidth / 2;
+    paddleX += (Math.max(PADDING, Math.min(canvasWidth - PADDING - paddleWidth, targetX)) - paddleX) * 0.18;
 
     for (let sub = 0; sub < SUB_STEPS; sub++) {
-      const prevX = ballX;
-      const prevY = ballY;
+      for (let bi = 0; bi < balls.length; bi++) {
+        const ball = balls[bi];
+        const speed = getBallSpeed(ball);
+        const stepVx = ball.vx / SUB_STEPS;
+        const stepVy = ball.vy / SUB_STEPS;
+        const prevX = ball.x;
+        const prevY = ball.y;
 
-      ballX += stepVx;
-      ballY += stepVy;
+        ball.x += stepVx;
+        ball.y += stepVy;
 
-      // Wall collisions
-      if (ballX - BALL_RADIUS < PADDING) {
-        ballX = PADDING + BALL_RADIUS;
-        ballVx = Math.abs(ballVx);
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, 1));
-      } else if (ballX + BALL_RADIUS > canvasWidth - PADDING) {
-        ballX = canvasWidth - PADDING - BALL_RADIUS;
-        ballVx = -Math.abs(ballVx);
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, -1));
-      }
-
-      if (ballY - BALL_RADIUS < PADDING) {
-        ballY = PADDING + BALL_RADIUS;
-        ballVy = Math.abs(ballVy);
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - canvasWidth / 2));
-      }
-
-      // Paddle collision with angle-based reflection
-      if (
-        ballVy > 0 &&
-        circleRectCollisionSide(
-          ballX,
-          ballY,
-          BALL_RADIUS,
-          paddleX,
-          paddleY,
-          PADDLE_WIDTH,
-          PADDLE_HEIGHT,
-          prevX,
-          prevY,
-        )
-      ) {
-        const hitPos = Math.max(0.05, Math.min(0.95, (ballX - paddleX) / PADDLE_WIDTH));
-        const maxDeflection = Math.PI * 0.4;
-        let angle = (hitPos - 0.5) * maxDeflection * 2;
-        if (Math.abs(angle) < MIN_BOUNCE_ANGLE) {
-          angle = Math.sign(angle || (ballX - paddleX - PADDLE_WIDTH / 2) || 1) * MIN_BOUNCE_ANGLE;
-        }
-        ballVx = BALL_SPEED * Math.sin(angle);
-        ballVy = -BALL_SPEED * Math.cos(angle);
-        ballY = paddleY - BALL_RADIUS - 0.5;
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - paddleX - PADDLE_WIDTH / 2));
-      }
-
-      // Brick collisions — resolve one per sub-step
-      for (let i = 0; i < simulatedBricks.length; i++) {
-        const brick = simulatedBricks[i];
-        if (!breakable(brick)) continue;
-
-        const side = circleRectCollisionSide(
-          ballX,
-          ballY,
-          BALL_RADIUS,
-          brick.x,
-          brick.y,
-          BRICK_SIZE,
-          BRICK_SIZE,
-          prevX,
-          prevY,
-        );
-
-        if (!side) continue;
-
-        if (side === "top" || side === "bottom") {
-          ballVy = -ballVy;
-          ballY = side === "top" ? brick.y - BALL_RADIUS - 0.5 : brick.y + BRICK_SIZE + BALL_RADIUS + 0.5;
-        } else {
-          ballVx = -ballVx;
-          ballX = side === "left" ? brick.x - BALL_RADIUS - 0.5 : brick.x + BRICK_SIZE + BALL_RADIUS + 0.5;
+        if (ball.x - BALL_RADIUS < PADDING) {
+          ball.x = PADDING + BALL_RADIUS;
+          ball.vx = Math.abs(ball.vx);
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, 1));
+        } else if (ball.x + BALL_RADIUS > canvasWidth - PADDING) {
+          ball.x = canvasWidth - PADDING - BALL_RADIUS;
+          ball.vx = -Math.abs(ball.vx);
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, -1));
         }
 
-        brick.status = "hidden";
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - (brick.x + BRICK_SIZE / 2)));
-        break;
+        if (ball.y - BALL_RADIUS < PADDING) {
+          ball.y = PADDING + BALL_RADIUS;
+          ball.vy = Math.abs(ball.vy);
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - canvasWidth / 2));
+        }
+
+        if (
+          ball.vy > 0 &&
+          circleRectCollisionSide(ball.x, ball.y, BALL_RADIUS, paddleX, paddleY, paddleWidth, PADDLE_HEIGHT, prevX, prevY)
+        ) {
+          const hitPos = Math.max(0.05, Math.min(0.95, (ball.x - paddleX) / paddleWidth));
+          const maxDeflection = Math.PI * 0.4;
+          let angle = (hitPos - 0.5) * maxDeflection * 2;
+          if (Math.abs(angle) < MIN_BOUNCE_ANGLE) {
+            angle = Math.sign(angle || (ball.x - paddleX - paddleWidth / 2) || 1) * MIN_BOUNCE_ANGLE;
+          }
+          ball.vx = speed * Math.sin(angle);
+          ball.vy = -speed * Math.cos(angle);
+          ball.y = paddleY - BALL_RADIUS - 0.5;
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2));
+        }
+
+        for (let i = 0; i < simulatedBricks.length; i++) {
+          const brick = simulatedBricks[i];
+          if (!breakable(brick)) continue;
+
+          const side = circleRectCollisionSide(ball.x, ball.y, BALL_RADIUS, brick.x, brick.y, BRICK_SIZE, BRICK_SIZE, prevX, prevY);
+          if (!side) continue;
+
+          if (side === "top" || side === "bottom") {
+            ball.vy = -ball.vy;
+            ball.y = side === "top" ? brick.y - BALL_RADIUS - 0.5 : brick.y + BRICK_SIZE + BALL_RADIUS + 0.5;
+          } else {
+            ball.vx = -ball.vx;
+            ball.x = side === "left" ? brick.x - BALL_RADIUS - 0.5 : brick.x + BRICK_SIZE + BALL_RADIUS + 0.5;
+          }
+
+          brick.status = "hidden";
+          spawnPowerUp(brick);
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - (brick.x + BRICK_SIZE / 2)));
+          break;
+        }
+
+        ball.x = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ball.x));
+        ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(canvasHeight - PADDING - BALL_RADIUS, ball.y));
       }
 
-      // Clamp position
-      ballX = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ballX));
-      ballY = Math.max(PADDING + BALL_RADIUS, Math.min(canvasHeight - PADDING - BALL_RADIUS, ballY));
+      // Fall power-ups
+      powerUps = powerUps.filter((pu) => {
+        pu.y += POWERUP_FALL_SPEED / SUB_STEPS;
+        const half = POWERUP_SIZE / 2;
+        const caught =
+          pu.y + half >= paddleY &&
+          pu.y - half <= paddleY + PADDLE_HEIGHT &&
+          pu.x >= paddleX - half &&
+          pu.x <= paddleX + paddleWidth + half;
+        if (caught) {
+          applyPowerUp(pu.type);
+          return false;
+        }
+        return pu.y < canvasHeight + POWERUP_SIZE;
+      });
+
+      balls = balls.filter((b) => b.y - BALL_RADIUS <= canvasHeight - PADDING + 5);
     }
 
-    // Escape vertical trap: ball bouncing in place with negligible horizontal movement
-    if (Math.abs(ballVx) < BALL_SPEED * MIN_VX_RATIO * 1.1) {
+    if (balls.length === 0) respawnBall();
+
+    const primary = balls[0];
+    if (primary && Math.abs(primary.vx) < BALL_SPEED * MIN_VX_RATIO * 1.1) {
       verticalTrapFrames++;
       if (verticalTrapFrames > 30) {
         const nudge = verticalTrapFrames % 2 === 0 ? 1 : -1;
-        ({ vx: ballVx, vy: ballVy } = clampVelocity(nudge * BALL_SPEED * MIN_VX_RATIO, ballVy, BALL_SPEED, nudge));
+        const speed = getBallSpeed(primary);
+        ({ vx: primary.vx, vy: primary.vy } = clampVelocity(nudge * speed * MIN_VX_RATIO, primary.vy, speed, nudge));
         verticalTrapFrames = 0;
       }
     } else {
@@ -318,10 +374,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
 
     if (frame % FRAME_SAMPLE === 0) {
       frameHistory.push({
-        ballX,
-        ballY,
         paddleX,
+        paddleWidth,
+        balls: balls.map((b) => ({ x: b.x, y: b.y })),
         bricks: simulatedBricks.map((b) => b.status),
+        powerUps: powerUps.map((pu) => ({ x: pu.x, y: pu.y, type: pu.type, id: pu.id })),
       });
     }
 
@@ -331,27 +388,73 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   return frameHistory;
 }
 
-/** @param {number[]} arr */
+function sparseKeyframes(states, getValue, defaultValue = 0) {
+  /** @type {{ f: number, v: number }[]} */
+  const changes = [];
+  let prev = /** @type {number | null} */ (null);
+  for (let f = 0; f < states.length; f++) {
+    const v = getValue(f);
+    if (prev === null || v !== prev) {
+      changes.push({ f, v });
+      prev = v;
+    }
+  }
+  if (changes.length <= 1) return null;
+  const denom = states.length - 1;
+  return {
+    keyTimes: changes.map((c) => (c.f / denom).toFixed(4)).join(";"),
+    values: changes.map((c) => c.v).join(";"),
+  };
+}
+
+function buildPowerUpEl(pu, states, duration) {
+  const { type, frames } = pu;
+  const meta = POWERUP_META[type];
+  let first = -1;
+  let last = -1;
+  let startX = 0;
+  let startY = 0;
+  let endY = 0;
+
+  for (let f = 0; f < frames.length; f++) {
+    if (frames[f]?.o === 1) {
+      if (first === -1) {
+        first = f;
+        startX = frames[f].x;
+        startY = frames[f].y;
+      }
+      last = f;
+      endY = frames[f].y;
+    }
+  }
+  if (first === -1) return "";
+
+  const denom = states.length - 1;
+  const t0 = (first / denom).toFixed(4);
+  const t1 = (last / denom).toFixed(4);
+  const tEnd = (Math.min(last + 1, denom) / denom).toFixed(4);
+  const half = POWERUP_SIZE / 2;
+
+  return `<g opacity="0"><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;${t0};${t1};${tEnd}" dur="${duration}s" repeatCount="indefinite"/><rect width="${POWERUP_SIZE}" height="${POWERUP_SIZE}" rx="2" fill="${meta.color}" x="${(startX - half).toFixed(1)}" y="${(startY - half).toFixed(1)}"><animate attributeName="y" values="${(startY - half).toFixed(1)};${(endY - half).toFixed(1)}" keyTimes="${t0};${t1}" dur="${duration}s" repeatCount="indefinite"/></rect><text font-size="7" font-family="monospace" fill="#111" text-anchor="middle" x="${startX.toFixed(1)}" y="${(startY + 1).toFixed(1)}">${meta.label}<animate attributeName="y" values="${startY.toFixed(1)};${endY.toFixed(1)}" keyTimes="${t0};${t1}" dur="${duration}s" repeatCount="indefinite"/></text></g>`;
+}
+
 function animValues(arr) {
   return arr.map((v) => v.toFixed(1)).join(";");
 }
 
-/** @param {string} svg */
 function minifySVG(svg) {
   return svg.replace(/\s{2,}/g, " ").replace(/>\s+</g, "><").replace(/\n/g, "");
 }
 
 /**
- * @param {ReturnType<typeof fetchContributions> extends Promise<infer T> ? T : never} days
- * @param {import("./themes.mjs").ColorPalette} colorPalette
+ * @param {({ level: number, contributionCount: number } | null)[][]} days
  * @param {{ bg: string, paddle: string, ball: string, bricks: import("./themes.mjs").ColorPalette }} themeColors
  * @param {boolean} enableGhostBricks
  * @param {number} seed
  */
-function buildSVG(days, colorPalette, themeColors, enableGhostBricks, seed) {
+function buildSVG(days, themeColors, enableGhostBricks, seed) {
   const brickColumnCount = days.length;
-  const canvasWidth =
-    brickColumnCount * (BRICK_SIZE + BRICK_GAP) + PADDING * 2 - BRICK_GAP;
+  const canvasWidth = brickColumnCount * (BRICK_SIZE + BRICK_GAP) + PADDING * 2 - BRICK_GAP;
   const bricksTotalHeight = 7 * (BRICK_SIZE + BRICK_GAP) - BRICK_GAP;
   const paddleY = PADDING + bricksTotalHeight + PADDLE_BRICK_GAP;
   const canvasHeight = paddleY + PADDLE_HEIGHT + PADDING + 20;
@@ -370,97 +473,87 @@ function buildSVG(days, colorPalette, themeColors, enableGhostBricks, seed) {
         colorClass: `c${day.level}`,
         status: "visible",
         hasCommit: day.contributionCount > 0,
+        index: bricks.length,
       });
     }
   }
 
-  const states = simulate(
-    bricks,
-    canvasWidth,
-    canvasHeight,
-    paddleY,
-    enableGhostBricks,
-    seed,
-  );
-
-  if (states.length < 2) {
-    throw new Error("Simulation produced too few frames");
-  }
+  const states = simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks, seed);
+  if (states.length < 2) throw new Error("Simulation produced too few frames");
 
   const duration = states.length * SECONDS_PER_FRAME;
-  const ballX = states.map((s) => s.ballX);
-  const ballY = states.map((s) => s.ballY);
+  const maxBalls = Math.max(...states.map((s) => s.balls.length), 1);
+
   const paddleXs = states.map((s) => s.paddleX);
+  const paddleWidths = states.map((s) => s.paddleWidth);
 
   const brickAnimData = bricks.map((_, i) => {
     let firstHidden = -1;
     for (let f = 0; f < states.length; f++) {
-      if (states[f].bricks[i] !== "visible") {
-        firstHidden = f;
-        break;
-      }
+      if (states[f].bricks[i] !== "visible") { firstHidden = f; break; }
     }
     if (firstHidden === -1) return { animate: false };
     const t = firstHidden / (states.length - 1);
-    return {
-      animate: true,
-      firstZero: firstHidden,
-      keyTimes: `0;${t.toFixed(4)};${t.toFixed(4)};1`,
-      values: "1;1;0;0",
-    };
+    return { animate: true, firstZero: firstHidden, keyTimes: `0;${t.toFixed(4)};${t.toFixed(4)};1`, values: "1;1;0;0" };
   });
 
-  const style = `<style>
-    .bg{fill:${themeColors.bg}}
-    ${palette.map((color, i) => `.c${i}{fill:${color}}`).join("")}
-  </style>`;
-
+  const style = `<style>.bg{fill:${themeColors.bg}}${palette.map((c, i) => `.c${i}{fill:${c}}`).join("")}</style>`;
   const brickSymbol = `<defs><symbol id="brick"><rect width="${BRICK_SIZE}" height="${BRICK_SIZE}" rx="${BRICK_RADIUS}"/></symbol></defs>`;
 
-  const brickUses = bricks
-    .map((brick, i) => {
-      const anim = brickAnimData[i];
-      const level = parseInt(brick.colorClass.slice(1), 10);
-      const origColor = palette[level] ?? palette[0];
-      const ghostColor = palette[0];
+  const brickUses = bricks.map((brick, i) => {
+    const anim = brickAnimData[i];
+    const level = parseInt(brick.colorClass.slice(1), 10);
+    const origColor = palette[level] ?? palette[0];
+    const ghostColor = palette[0];
 
-      if (enableGhostBricks && anim.animate) {
-        const t = anim.firstZero / (states.length - 1);
-        return `<use href="#brick" x="${brick.x}" y="${brick.y}" fill="${origColor}">
-          <animate attributeName="fill" values="${origColor};${origColor};${ghostColor};${ghostColor}"
-            keyTimes="0;${t.toFixed(4)};${t.toFixed(4)};1"
-            dur="${duration}s" fill="freeze" repeatCount="indefinite"/>
-        </use>`;
+    if (enableGhostBricks && anim.animate) {
+      const t = anim.firstZero / (states.length - 1);
+      return `<use href="#brick" x="${brick.x}" y="${brick.y}" fill="${origColor}"><animate attributeName="fill" values="${origColor};${origColor};${ghostColor};${ghostColor}" keyTimes="0;${t.toFixed(4)};${t.toFixed(4)};1" dur="${duration}s" fill="freeze" repeatCount="indefinite"/></use>`;
+    }
+    if (anim.animate) {
+      return `<use href="#brick" x="${brick.x}" y="${brick.y}" class="${brick.colorClass}"><animate attributeName="opacity" values="${anim.values}" keyTimes="${anim.keyTimes}" dur="${duration}s" fill="freeze" repeatCount="indefinite"/></use>`;
+    }
+    return `<use href="#brick" x="${brick.x}" y="${brick.y}" class="${brick.colorClass}"/>`;
+  }).join("");
+
+  const paddle = `<g transform="translate(0,${paddleY})"><rect y="0" height="${PADDLE_HEIGHT}" rx="${PADDLE_RADIUS}" fill="${themeColors.paddle}"><animate attributeName="x" values="${animValues(paddleXs)}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="width" values="${animValues(paddleWidths)}" dur="${duration}s" repeatCount="indefinite"/></rect></g>`;
+
+  /** @type {string[]} */
+  const ballEls = [];
+  for (let bi = 0; bi < maxBalls; bi++) {
+    const cx = states.map((s) => s.balls[bi]?.x ?? -100);
+    const cy = states.map((s) => s.balls[bi]?.y ?? -100);
+    const opacityAnim = sparseKeyframes(states, (f) => (states[f].balls[bi] ? 1 : 0));
+    const opacityAttr = opacityAnim
+      ? `<animate attributeName="opacity" values="${opacityAnim.values}" keyTimes="${opacityAnim.keyTimes}" dur="${duration}s" repeatCount="indefinite"/>`
+      : "";
+    const initialOpacity = states[0].balls[bi] ? 1 : 0;
+    ballEls.push(`<circle r="${BALL_RADIUS}" fill="${themeColors.ball}" opacity="${initialOpacity}"><animate attributeName="cx" values="${animValues(cx)}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="cy" values="${animValues(cy)}" dur="${duration}s" repeatCount="indefinite"/>${opacityAttr}</circle>`);
+  }
+
+  /** @type {Map<string, { type: PowerUpType, frames: {x:number,y:number,o:number}[] }>} */
+  const puMap = new Map();
+
+  for (let f = 0; f < states.length; f++) {
+    const currentKeys = new Set();
+    for (const pu of states[f].powerUps) {
+      const key = `pu-${pu.id}`;
+      currentKeys.add(key);
+      if (!puMap.has(key)) puMap.set(key, { type: pu.type, frames: [] });
+      puMap.get(key).frames[f] = { x: pu.x, y: pu.y, o: 1 };
+    }
+    for (const [key, entry] of puMap) {
+      if (!currentKeys.has(key) && entry.frames[f - 1]) {
+        entry.frames[f] = { x: entry.frames[f - 1].x, y: entry.frames[f - 1].y, o: 0 };
+      } else if (!entry.frames[f]) {
+        entry.frames[f] = { x: -100, y: -100, o: 0 };
       }
+    }
+  }
 
-      if (anim.animate) {
-        return `<use href="#brick" x="${brick.x}" y="${brick.y}" class="${brick.colorClass}">
-          <animate attributeName="opacity" values="${anim.values}" keyTimes="${anim.keyTimes}"
-            dur="${duration}s" fill="freeze" repeatCount="indefinite"/>
-        </use>`;
-      }
+  const powerUpEls = [...puMap.values()].map((pu) => buildPowerUpEl(pu, states, duration)).join("");
 
-      return `<use href="#brick" x="${brick.x}" y="${brick.y}" class="${brick.colorClass}"/>`;
-    })
-    .join("");
-
-  const paddle = `<g transform="translate(0,${paddleY})">
-    <rect y="0" width="${PADDLE_WIDTH}" height="${PADDLE_HEIGHT}" rx="${PADDLE_RADIUS}" fill="${themeColors.paddle}">
-      <animate attributeName="x" values="${animValues(paddleXs)}" dur="${duration}s" repeatCount="indefinite"/>
-    </rect>
-  </g>`;
-
-  const ball = `<circle r="${BALL_RADIUS}" fill="${themeColors.ball}">
-    <animate attributeName="cx" values="${animValues(ballX)}" dur="${duration}s" repeatCount="indefinite"/>
-    <animate attributeName="cy" values="${animValues(ballY)}" dur="${duration}s" repeatCount="indefinite"/>
-  </circle>`;
-
-  return minifySVG(
-    `<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg">
-      <rect class="bg" width="100%" height="100%"/>
-      ${style}${brickSymbol}${brickUses}${paddle}${ball}
-    </svg>`,
-  );
+  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${powerUpEls}${paddle}${ballEls.join("")}</svg>`);
 }
 
 async function main() {
@@ -475,28 +568,21 @@ async function main() {
 
   console.log(`Fetching contributions for ${username}...`);
   const days = await fetchContributions(username, token);
-
-  const seed = days.reduce((acc, week) => {
-    return acc + week.reduce((w, d) => w + (d?.contributionCount ?? 0), 0);
-  }, 0);
+  const seed = days.reduce((acc, week) => acc + week.reduce((w, d) => w + (d?.contributionCount ?? 0), 0), 0);
 
   mkdirSync(outputPath, { recursive: true });
 
   for (const [themeId, theme] of Object.entries(THEMES)) {
     for (const mode of ["light", "dark"]) {
-      const colors = theme[mode];
       const filename = `breakout-${themeId}-${mode}.svg`;
       console.log(`Generating ${filename}...`);
-
-      const svg = buildSVG(days, colors.bricks, colors, true, seed + themeId.length);
+      const svg = buildSVG(days, theme[mode], true, seed + themeId.length);
       writeFileSync(join(outputPath, filename), svg);
     }
   }
 
-  // Legacy filenames for backward compatibility
   copyFileSync(join(outputPath, "breakout-github-light.svg"), join(outputPath, "breakout-light.svg"));
   copyFileSync(join(outputPath, "breakout-github-dark.svg"), join(outputPath, "breakout-dark.svg"));
-
   console.log(`Done! Generated ${Object.keys(THEMES).length * 2} themed SVGs.`);
 }
 
