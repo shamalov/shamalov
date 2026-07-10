@@ -19,7 +19,9 @@ const SUB_STEPS = 6;
 const SECONDS_PER_FRAME = 1 / 30;
 const FRAME_SAMPLE = 2; // sample every N simulation frames for smaller SVGs
 const MAX_FRAMES = 40000;
-const MIN_BOUNCE_ANGLE = 0.35; // radians (~20°) — prevents flat horizontal bouncing
+const MIN_BOUNCE_ANGLE = 0.35; // radians (~20°) — prevents vertical/horizontal trap loops
+const MIN_VX_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
+const MIN_VY_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
 
 /**
  * @param {string} userName
@@ -97,19 +99,35 @@ function normalizeVelocity(vx, vy, speed) {
 }
 
 /**
+ * Keep speed constant while ensuring the ball never travels too vertically
+ * or too horizontally (either causes infinite bounce loops).
  * @param {number} vx
  * @param {number} vy
  * @param {number} speed
+ * @param {number} [biasX=0] deterministic horizontal sign when vx is ~0
  */
-function enforceMinAngle(vx, vy, speed) {
-  const angle = Math.abs(Math.atan2(vx, vy));
-  if (angle < MIN_BOUNCE_ANGLE) {
-    const sign = vx >= 0 ? 1 : -1;
-    const newVx = sign * speed * Math.sin(MIN_BOUNCE_ANGLE);
-    const newVy = -speed * Math.cos(MIN_BOUNCE_ANGLE);
-    return { vx: newVx, vy: newVy };
+function clampVelocity(vx, vy, speed, biasX = 0) {
+  let nvx = vx;
+  let nvy = vy;
+
+  const minVx = speed * MIN_VX_RATIO;
+  const minVy = speed * MIN_VY_RATIO;
+
+  // Prevent vertical trap loops (vx ≈ 0)
+  if (Math.abs(nvx) < minVx) {
+    const sign = nvx !== 0 ? Math.sign(nvx) : (biasX !== 0 ? Math.sign(biasX) : 1);
+    nvx = sign * minVx;
+    nvy = Math.sign(nvy || -1) * Math.sqrt(speed * speed - nvx * nvx);
   }
-  return { vx, vy };
+
+  // Prevent horizontal trap loops (vy ≈ 0)
+  if (Math.abs(nvy) < minVy) {
+    const sign = nvy !== 0 ? Math.sign(nvy) : -1;
+    nvy = sign * minVy;
+    nvx = Math.sign(nvx || 1) * Math.sqrt(speed * speed - nvy * nvy);
+  }
+
+  return normalizeVelocity(nvx, nvy, speed);
 }
 
 /**
@@ -178,6 +196,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   const frameHistory = [];
   let paddleX = (canvasWidth - PADDLE_WIDTH) / 2;
   let frame = 0;
+  let verticalTrapFrames = 0;
 
   const breakable = (/** @type {Brick} */ b) =>
     b.status === "visible" && (!enableGhostBricks || b.hasCommit);
@@ -208,14 +227,17 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       if (ballX - BALL_RADIUS < PADDING) {
         ballX = PADDING + BALL_RADIUS;
         ballVx = Math.abs(ballVx);
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, 1));
       } else if (ballX + BALL_RADIUS > canvasWidth - PADDING) {
         ballX = canvasWidth - PADDING - BALL_RADIUS;
         ballVx = -Math.abs(ballVx);
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, -1));
       }
 
       if (ballY - BALL_RADIUS < PADDING) {
         ballY = PADDING + BALL_RADIUS;
         ballVy = Math.abs(ballVy);
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - canvasWidth / 2));
       }
 
       // Paddle collision with angle-based reflection
@@ -233,13 +255,16 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           prevY,
         )
       ) {
-        const hitPos = Math.max(0, Math.min(1, (ballX - paddleX) / PADDLE_WIDTH));
+        const hitPos = Math.max(0.05, Math.min(0.95, (ballX - paddleX) / PADDLE_WIDTH));
         const maxDeflection = Math.PI * 0.4;
-        const angle = (hitPos - 0.5) * maxDeflection * 2;
+        let angle = (hitPos - 0.5) * maxDeflection * 2;
+        if (Math.abs(angle) < MIN_BOUNCE_ANGLE) {
+          angle = Math.sign(angle || (ballX - paddleX - PADDLE_WIDTH / 2) || 1) * MIN_BOUNCE_ANGLE;
+        }
         ballVx = BALL_SPEED * Math.sin(angle);
         ballVy = -BALL_SPEED * Math.cos(angle);
         ballY = paddleY - BALL_RADIUS - 0.5;
-        ({ vx: ballVx, vy: ballVy } = enforceMinAngle(ballVx, ballVy, BALL_SPEED));
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - paddleX - PADDLE_WIDTH / 2));
       }
 
       // Brick collisions — resolve one per sub-step
@@ -270,14 +295,25 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         }
 
         brick.status = "hidden";
-        ({ vx: ballVx, vy: ballVy } = normalizeVelocity(ballVx, ballVy, BALL_SPEED));
-        ({ vx: ballVx, vy: ballVy } = enforceMinAngle(ballVx, ballVy, BALL_SPEED));
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(ballVx, ballVy, BALL_SPEED, ballX - (brick.x + BRICK_SIZE / 2)));
         break;
       }
 
       // Clamp position
       ballX = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ballX));
       ballY = Math.max(PADDING + BALL_RADIUS, Math.min(canvasHeight - PADDING - BALL_RADIUS, ballY));
+    }
+
+    // Escape vertical trap: ball bouncing in place with negligible horizontal movement
+    if (Math.abs(ballVx) < BALL_SPEED * MIN_VX_RATIO * 1.1) {
+      verticalTrapFrames++;
+      if (verticalTrapFrames > 30) {
+        const nudge = verticalTrapFrames % 2 === 0 ? 1 : -1;
+        ({ vx: ballVx, vy: ballVy } = clampVelocity(nudge * BALL_SPEED * MIN_VX_RATIO, ballVy, BALL_SPEED, nudge));
+        verticalTrapFrames = 0;
+      }
+    } else {
+      verticalTrapFrames = 0;
     }
 
     if (frame % FRAME_SAMPLE === 0) {
