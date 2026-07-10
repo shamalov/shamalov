@@ -11,20 +11,22 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: generate SVG
-        uses: cyprieng/github-breakout@v1
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          github_username: ${{ github.repository_owner }}
+          node-version: "22"
 
-      - name: Move generated SVGs to temp
-        run: |
-          mkdir -p /tmp/breakout-images
-          mv output/light.svg /tmp/breakout-images/breakout-light.svg
-          mv output/dark.svg /tmp/breakout-images/breakout-dark.svg
+      - name: Generate themed breakout SVGs
+        env:
+          GITHUB_USERNAME: ${{ github.repository_owner }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTPUT_PATH: ./output
+        run: node scripts/generate-breakout.mjs
 
       - name: Configure git
         run: |
@@ -35,8 +37,8 @@ jobs:
         run: |
           git checkout --orphan github-breakout
           git rm -rf .
-          mkdir images
-          mv /tmp/breakout-images/* images/
+          mkdir -p images
+          mv output/*.svg images/
           git add images
           git commit -m "chore: update GitHub breakout SVGs" || echo "No changes to commit"
           git push --force origin github-breakout
