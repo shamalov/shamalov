@@ -340,17 +340,26 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - canvasWidth / 2));
         }
 
-        // Paddle — must cross top edge while moving down
-        const prevBottom = prevY + BALL_RADIUS;
-        const currBottom = ball.y + BALL_RADIUS;
-        const crossedPaddle =
-          ball.vy > 0 &&
-          prevBottom <= paddleY &&
-          currBottom >= paddleY &&
+        // Paddle — swept crossing OR overlap recovery (prevents tunneling under paddle)
+        const paddleBottom = paddleY + PADDLE_HEIGHT;
+        const horizOnPaddle =
           ball.x + BALL_RADIUS > paddleX &&
           ball.x - BALL_RADIUS < paddleX + paddleWidth;
+        const prevBottom = prevY + BALL_RADIUS;
+        const currBottom = ball.y + BALL_RADIUS;
+        const prevTop = prevY - BALL_RADIUS;
+        const sweptPaddle =
+          ball.vy > 0 &&
+          horizOnPaddle &&
+          prevTop < paddleBottom &&
+          currBottom > paddleY;
+        const insidePaddle =
+          ball.vy > 0 &&
+          horizOnPaddle &&
+          currBottom > paddleY &&
+          ball.y - BALL_RADIUS < paddleBottom;
 
-        if (crossedPaddle) {
+        if (sweptPaddle || insidePaddle) {
           const hitPos = Math.max(0.05, Math.min(0.95, (ball.x - paddleX) / paddleWidth));
           const maxDeflection = Math.PI * 0.4;
           let angle = (hitPos - 0.5) * maxDeflection * 2;
@@ -361,6 +370,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ball.vy = -speed * Math.cos(angle);
           ball.y = paddleY - BALL_RADIUS - 0.01;
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2));
+        }
+
+        // Ball fell past paddle — remove it (no lingering under the slider)
+        if (ball.y - BALL_RADIUS > paddleBottom) {
+          ball.y = Infinity;
         }
 
         // Brick collisions — first contact only, closest brick wins
@@ -396,7 +410,9 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         }
 
         ball.x = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ball.x));
-        ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(canvasHeight - PADDING - BALL_RADIUS, ball.y));
+        if (ball.y !== Infinity) {
+          ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(paddleY - BALL_RADIUS, ball.y));
+        }
       }
 
       // Fall power-ups
@@ -415,7 +431,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         return pu.y < canvasHeight + POWERUP_SIZE;
       });
 
-      balls = balls.filter((b) => b.y - BALL_RADIUS <= canvasHeight - PADDING + 5);
+      balls = balls.filter((b) => b.y !== Infinity && b.y - BALL_RADIUS <= paddleY + PADDLE_HEIGHT);
     }
 
     if (balls.length === 0) respawnBall();
