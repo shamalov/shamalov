@@ -13,8 +13,9 @@ const BALL_RADIUS = 5;
 const BRICK_SIZE = 12;
 const BRICK_GAP = 3;
 const BRICK_RADIUS = 3;
-const POWERUP_SIZE = 9;
-const POWERUP_FALL_SPEED = 2.2;
+const POWERUP_SIZE = 11;
+const POWERUP_FALL_SPEED = 1.8;
+const POWERUP_SPAWN_INTERVAL = 5;
 
 // Simulation
 const BALL_SPEED = 8;
@@ -254,7 +255,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   const spawnPowerUp = (/** @type {Brick} */ brick) => {
     if (!brick.hasCommit) return;
     brokenCount++;
-    if ((brick.index + seed + brokenCount) % 10 !== 0) return;
+    if (brokenCount % POWERUP_SPAWN_INTERVAL !== 0) return;
     const type = POWERUP_TYPES[(brick.index + seed + brokenCount) % POWERUP_TYPES.length];
     powerUps.push({
       x: brick.x + BRICK_SIZE / 2,
@@ -262,6 +263,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       type,
       id: powerUpId++,
     });
+    recordExtra = true;
   };
 
   const applyPowerUp = (/** @type {PowerUpType} */ type) => {
@@ -480,35 +482,18 @@ function sparseKeyframes(states, getValue, defaultValue = 0) {
   };
 }
 
-function buildPowerUpEl(pu, states, duration) {
-  const { type, frames } = pu;
+function buildPowerUpEl(lc, duration) {
+  const { type, xs, ys, opacity } = lc;
   const meta = POWERUP_META[type];
-  let first = -1;
-  let last = -1;
-  let startX = 0;
-  let startY = 0;
-  let endY = 0;
-
-  for (let f = 0; f < frames.length; f++) {
-    if (frames[f]?.o === 1) {
-      if (first === -1) {
-        first = f;
-        startX = frames[f].x;
-        startY = frames[f].y;
-      }
-      last = f;
-      endY = frames[f].y;
-    }
-  }
-  if (first === -1) return "";
-
-  const denom = states.length - 1;
-  const t0 = (first / denom).toFixed(4);
-  const t1 = (last / denom).toFixed(4);
-  const tEnd = (Math.min(last + 1, denom) / denom).toFixed(4);
   const half = POWERUP_SIZE / 2;
 
-  return `<g opacity="0"><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;${t0};${t1};${tEnd}" dur="${duration}s" repeatCount="indefinite"/><rect width="${POWERUP_SIZE}" height="${POWERUP_SIZE}" rx="2" fill="${meta.color}" x="${(startX - half).toFixed(1)}" y="${(startY - half).toFixed(1)}"><animate attributeName="y" values="${(startY - half).toFixed(1)};${(endY - half).toFixed(1)}" keyTimes="${t0};${t1}" dur="${duration}s" repeatCount="indefinite"/></rect><text font-size="7" font-family="monospace" fill="#111" text-anchor="middle" x="${startX.toFixed(1)}" y="${(startY + 1).toFixed(1)}">${meta.label}<animate attributeName="y" values="${startY.toFixed(1)};${endY.toFixed(1)}" keyTimes="${t0};${t1}" dur="${duration}s" repeatCount="indefinite"/></text></g>`;
+  const visible = opacity.some((o) => o === 1);
+  if (!visible) return "";
+
+  const xAnim = xs.map((x) => (x > 0 ? x - half : -100).toFixed(1));
+  const yAnim = ys.map((y) => (y > 0 ? y - half : -100).toFixed(1));
+
+  return `<g><rect width="${POWERUP_SIZE}" height="${POWERUP_SIZE}" rx="2" fill="${meta.color}" stroke="#000" stroke-width="0.5" opacity="${opacity[0]}"><animate attributeName="x" values="${xAnim.join(";")}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="y" values="${yAnim.join(";")}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="opacity" values="${opacity.join(";")}" dur="${duration}s" repeatCount="indefinite"/></rect><text font-size="8" font-weight="bold" font-family="monospace" fill="#111" text-anchor="middle" dominant-baseline="middle" opacity="${opacity[0]}">${meta.label}<animate attributeName="x" values="${xs.map((x) => (x > 0 ? x : -100).toFixed(1)).join(";")}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="y" values="${ys.map((y) => (y > 0 ? y + 1 : -100).toFixed(1)).join(";")}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="opacity" values="${opacity.join(";")}" dur="${duration}s" repeatCount="indefinite"/></text></g>`;
 }
 
 function animValues(arr) {
@@ -609,29 +594,39 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
     ballEls.push(`<circle r="${BALL_RADIUS}" fill="${themeColors.ball}" opacity="${initialOpacity}"><animate attributeName="cx" values="${animValues(cx)}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="cy" values="${animValues(cy)}" dur="${duration}s" repeatCount="indefinite"/>${opacityAttr}</circle>`);
   }
 
-  /** @type {Map<string, { type: PowerUpType, frames: {x:number,y:number,o:number}[] }>} */
-  const puMap = new Map();
+  /** @type {Map<number, { type: PowerUpType, xs: number[], ys: number[], opacity: number[] }>} */
+  const puLifecycles = new Map();
+  const knownIds = new Set();
 
   for (let f = 0; f < states.length; f++) {
-    const currentKeys = new Set();
-    for (const pu of states[f].powerUps) {
-      const key = `pu-${pu.id}`;
-      currentKeys.add(key);
-      if (!puMap.has(key)) puMap.set(key, { type: pu.type, frames: [] });
-      puMap.get(key).frames[f] = { x: pu.x, y: pu.y, o: 1 };
-    }
-    for (const [key, entry] of puMap) {
-      if (!currentKeys.has(key) && entry.frames[f - 1]) {
-        entry.frames[f] = { x: entry.frames[f - 1].x, y: entry.frames[f - 1].y, o: 0 };
-      } else if (!entry.frames[f]) {
-        entry.frames[f] = { x: -100, y: -100, o: 0 };
+    for (const pu of states[f].powerUps) knownIds.add(pu.id);
+
+    for (const id of knownIds) {
+      if (!puLifecycles.has(id)) {
+        const pu = states[f].powerUps.find((p) => p.id === id);
+        if (!pu) continue;
+        puLifecycles.set(id, {
+          type: pu.type,
+          xs: new Array(states.length).fill(-100),
+          ys: new Array(states.length).fill(-100),
+          opacity: new Array(states.length).fill(0),
+        });
+      }
+      const lc = puLifecycles.get(id);
+      const pu = states[f].powerUps.find((p) => p.id === id);
+      if (pu) {
+        lc.xs[f] = pu.x;
+        lc.ys[f] = pu.y;
+        lc.opacity[f] = 1;
+      } else if (f > 0) {
+        lc.opacity[f] = 0;
       }
     }
   }
 
-  const powerUpEls = [...puMap.values()].map((pu) => buildPowerUpEl(pu, states, duration)).join("");
+  const powerUpEls = [...puLifecycles.values()].map((lc) => buildPowerUpEl(lc, duration)).join("");
 
-  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${powerUpEls}${ballEls.join("")}${paddle}</svg>`);
+  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${ballEls.join("")}${paddle}${powerUpEls}</svg>`);
 }
 
 async function main() {
