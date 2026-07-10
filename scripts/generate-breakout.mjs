@@ -15,7 +15,9 @@ const BRICK_GAP = 3;
 const BRICK_RADIUS = 3;
 const POWERUP_SIZE = 11;
 const POWERUP_FALL_SPEED = 1.4;
-const POWERUP_SPAWN_INTERVAL = 5;
+const POWERUP_SPAWN_INTERVAL = 4;
+const HUD_HEIGHT = 16;
+const STARTING_LIVES = 3;
 
 // Simulation
 const BALL_SPEED = 6;
@@ -37,9 +39,9 @@ const PADDLE_ACCEL = 0.22;
 const BALL_FALL_TRACK_FRAMES = 90;
 const POWERUP_CHASE_FRAMES = 55;
 
-/** @typedef {'multi' | 'wide' | 'fast' | 'slow'} PowerUpType */
+/** @typedef {'multi' | 'wide' | 'fast' | 'slow' | 'xp'} PowerUpType */
 
-/** @type {Record<PowerUpType, { label: string, color: string }>} */
+/** @type {Record<Exclude<PowerUpType, 'xp'>, { label: string, color: string }>} */
 const POWERUP_META = {
   multi: { label: "●●", color: "#f7ff00" },
   wide: { label: "↔", color: "#58A6FF" },
@@ -47,8 +49,30 @@ const POWERUP_META = {
   slow: { label: "«", color: "#b388ff" },
 };
 
+const XP_POWERUP_COLOR = "#3ddc84";
+
 /** @type {PowerUpType[]} */
-const POWERUP_TYPES = ["multi", "wide", "fast", "slow"];
+const POWERUP_TYPES = ["multi", "wide", "fast", "slow", "xp"];
+
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function xpFromContribution(contributionCount, level) {
+  if (contributionCount <= 0) return 0;
+  const tier = [8, 15, 28, 45, 70][level] ?? 10;
+  return tier + contributionCount * 4;
+}
+
+function brickPoints(contributionCount, level) {
+  return 10 + level * 15 + contributionCount * 6;
+}
 
 /**
  * @param {string} userName
@@ -203,11 +227,11 @@ function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
 }
 
 /**
- * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean, index: number }} Brick
+ * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean, index: number, contributionCount: number, level: number }} Brick
  * @typedef {{ id: number, slot: number, x: number, y: number, vx: number, vy: number, speed: number, alive: boolean }} Ball
- * @typedef {{ x: number, y: number, type: PowerUpType, id: number }} PowerUp
+ * @typedef {{ x: number, y: number, type: PowerUpType, id: number, xpValue?: number }} PowerUp
  * @typedef {{ slot: number, x: number, y: number, alive: boolean }} BallSnapshot
- * @typedef {{ paddleX: number, paddleWidth: number, balls: BallSnapshot[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
+ * @typedef {{ paddleX: number, paddleWidth: number, balls: BallSnapshot[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType,xpValue?:number}[], score: number, lives: number, xp: number, gameOver: boolean }} FrameState
  */
 
 /**
@@ -219,9 +243,11 @@ function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
  * @param {number} seed
  */
 function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks, seed) {
+  const rand = mulberry32(seed);
+  const topBound = HUD_HEIGHT + PADDING + BALL_RADIUS;
   const paddleContactY = paddleY - BALL_RADIUS;
   const paddleBottom = paddleY + PADDLE_HEIGHT;
-  const launchAngle = -Math.PI / 4 + ((seed % 7) - 3) * 0.04;
+  const launchAngle = -Math.PI / 4 + (rand() - 0.5) * 0.9;
   let nextBallId = 0;
   /** @type {number[]} */
   let freeSlots = [1, 2, 3];
@@ -256,6 +282,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   let frame = 0;
   let brokenCount = 0;
   let recordExtra = false;
+  let lives = STARTING_LIVES;
+  let score = 0;
+  let xp = 0;
+  let gameOver = false;
+  let xpSpawned = false;
 
   const breakable = (/** @type {Brick} */ b) =>
     b.status === "visible" && (!enableGhostBricks || b.hasCommit);
@@ -273,18 +304,39 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
     if (!brick.hasCommit) return;
     brokenCount++;
     if (brokenCount % POWERUP_SPAWN_INTERVAL !== 0) return;
-    const type = POWERUP_TYPES[(brick.index + seed + brokenCount) % POWERUP_TYPES.length];
-    powerUps.push({
+
+    /** @type {PowerUpType} */
+    let type;
+    if (!xpSpawned) {
+      type = "xp";
+      xpSpawned = true;
+    } else {
+      type = POWERUP_TYPES[Math.floor(rand() * POWERUP_TYPES.length)];
+      if (type === "xp" && brick.contributionCount === 0) {
+        type = /** @type {PowerUpType} */ (POWERUP_TYPES[Math.floor(rand() * 4)]);
+      }
+    }
+
+    const pu = {
       x: brick.x + BRICK_SIZE / 2,
       y: brick.y + BRICK_SIZE / 2,
       type,
       id: powerUpId++,
-    });
+    };
+    if (type === "xp") {
+      pu.xpValue = xpFromContribution(brick.contributionCount, brick.level);
+    }
+    powerUps.push(pu);
     recordExtra = true;
   };
 
-  const applyPowerUp = (/** @type {PowerUpType} */ type) => {
-    if (type === "multi") {
+  const applyPowerUp = (/** @type {PowerUp} */ pu) => {
+    const type = pu.type;
+    if (type === "xp") {
+      xp += pu.xpValue ?? xpFromContribution(1, 1);
+      score += pu.xpValue ?? 10;
+      recordExtra = true;
+    } else if (type === "multi") {
       const alive = balls.filter((b) => b.alive);
       const src = alive[0] ?? balls[0];
       const spawnX = paddleX + paddleWidth / 2;
@@ -325,7 +377,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   };
 
   const respawnBall = () => {
-    const angle = -Math.PI / 4;
+    const angle = -Math.PI / 4 + (rand() - 0.5) * 0.6;
     freeSlots = [1, 2, 3];
     balls = [{
       id: nextBallId++,
@@ -337,6 +389,19 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       speed: BALL_SPEED,
       alive: true,
     }];
+    recordExtra = true;
+  };
+
+  const aliveBalls = () => balls.filter((b) => b.alive);
+
+  const ensureBallInPlay = () => {
+    if (gameOver) return;
+    if (aliveBalls().length === 0) {
+      lives--;
+      if (lives > 0) respawnBall();
+      else gameOver = true;
+      recordExtra = true;
+    }
   };
 
   const snapshotBalls = () =>
@@ -351,10 +416,10 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       };
     });
 
-  const movePaddleToward = (/** @type {number} */ targetX) => {
+  const movePaddleToward = (/** @type {number} */ targetX, /** @type {number} */ boost = 1) => {
     const clamped = clampPaddleX(targetX, paddleWidth, canvasWidth);
     const dx = clamped - paddleX;
-    const maxStep = PADDLE_MAX_SPEED / SUB_STEPS;
+    const maxStep = (PADDLE_MAX_SPEED * boost) / SUB_STEPS;
     const desiredVel = Math.abs(dx) <= maxStep
       ? dx
       : Math.sign(dx) * maxStep;
@@ -364,12 +429,16 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
     if (Math.abs(dx) < 0.05) paddleVel *= 0.5;
   };
 
-  while (simulatedBricks.some(breakable) && frame < MAX_FRAMES) {
+  while (simulatedBricks.some(breakable) && frame < MAX_FRAMES && !gameOver) {
     paddleWidth = frame < wideUntil ? PADDLE_WIDTH * PADDLE_WIDE_SCALE : PADDLE_WIDTH;
+    const aliveCount = aliveBalls().length;
+    const saveBoost = aliveCount <= 1 ? 1.35 : 1;
 
     for (let sub = 0; sub < SUB_STEPS; sub++) {
-      const target = getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY);
-      movePaddleToward(target.x);
+      const target = getPaddleTarget(
+        powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY, topBound, saveBoost,
+      );
+      movePaddleToward(target.x, saveBoost);
 
       for (let bi = 0; bi < balls.length; bi++) {
         const ball = balls[bi];
@@ -394,8 +463,8 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, -1));
         }
 
-        if (ball.y - BALL_RADIUS < PADDING && prevY - BALL_RADIUS >= PADDING) {
-          ball.y = PADDING + BALL_RADIUS;
+        if (ball.y - BALL_RADIUS < topBound && prevY - BALL_RADIUS >= topBound) {
+          ball.y = topBound;
           ball.vy = Math.abs(ball.vy);
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - canvasWidth / 2));
         }
@@ -467,14 +536,16 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
 
           if (breakable(brick)) {
             brick.status = "hidden";
+            score += brickPoints(brick.contributionCount, brick.level);
             spawnPowerUp(brick);
+            recordExtra = true;
           }
         }
 
         ball.x = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ball.x));
         if (ball.y !== Infinity) {
           const maxY = horizOnPaddle ? paddleContactY : paddleBottom;
-          ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(maxY, ball.y));
+          ball.y = Math.max(topBound, Math.min(maxY, ball.y));
         }
       }
 
@@ -488,15 +559,14 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           pu.x >= paddleX - half &&
           pu.x <= paddleX + paddleWidth + half;
         if (caught) {
-          applyPowerUp(pu.type);
+          applyPowerUp(pu);
           return false;
         }
         return pu.y < canvasHeight + POWERUP_SIZE;
       });
 
+      ensureBallInPlay();
     }
-
-    if (balls.every((b) => !b.alive)) respawnBall();
 
     if (frame % FRAME_SAMPLE === 0 || recordExtra) {
       frameHistory.push({
@@ -504,7 +574,13 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         paddleWidth,
         balls: snapshotBalls(),
         bricks: simulatedBricks.map((b) => b.status),
-        powerUps: powerUps.map((pu) => ({ x: pu.x, y: pu.y, type: pu.type, id: pu.id })),
+        powerUps: powerUps.map((pu) => ({
+          x: pu.x, y: pu.y, type: pu.type, id: pu.id, xpValue: pu.xpValue,
+        })),
+        score,
+        lives,
+        xp,
+        gameOver,
       });
       recordExtra = false;
     }
@@ -512,13 +588,29 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
     frame++;
   }
 
+  if (frameHistory.length === 0 || frameHistory[frameHistory.length - 1].gameOver !== gameOver) {
+    frameHistory.push({
+      paddleX,
+      paddleWidth,
+      balls: snapshotBalls(),
+      bricks: simulatedBricks.map((b) => b.status),
+      powerUps: powerUps.map((pu) => ({
+        x: pu.x, y: pu.y, type: pu.type, id: pu.id, xpValue: pu.xpValue,
+      })),
+      score,
+      lives,
+      xp,
+      gameOver,
+    });
+  }
+
   return frameHistory;
 }
 
-function predictBallInterceptX(ball, paddleY, canvasWidth) {
+function predictBallInterceptX(ball, paddleY, canvasWidth, topBound = HUD_HEIGHT + PADDING + BALL_RADIUS) {
   const left = PADDING + BALL_RADIUS;
   const right = canvasWidth - PADDING - BALL_RADIUS;
-  const top = PADDING + BALL_RADIUS;
+  const top = topBound;
 
   if (ball.vy > 0) {
     let t = (paddleY - ball.y - BALL_RADIUS) / ball.vy;
@@ -555,10 +647,10 @@ function predictBallInterceptX(ball, paddleY, canvasWidth) {
   return Math.max(left, Math.min(right, x));
 }
 
-function paddleCanReach(paddleX, paddleWidth, targetCenterX, canvasWidth, framesLeft) {
+function paddleCanReach(paddleX, paddleWidth, targetCenterX, canvasWidth, framesLeft, boost = 1) {
   const targetX = clampPaddleX(targetCenterX - paddleWidth / 2, paddleWidth, canvasWidth);
   const dist = Math.abs(targetX - paddleX);
-  return dist <= PADDLE_MAX_SPEED * framesLeft + paddleWidth * 0.15;
+  return dist <= PADDLE_MAX_SPEED * boost * framesLeft + paddleWidth * 0.15;
 }
 
 /**
@@ -569,19 +661,37 @@ function paddleCanReach(paddleX, paddleWidth, targetCenterX, canvasWidth, frames
  * @param {number} paddleWidth
  * @param {number} canvasWidth
  * @param {number} paddleContactY
+ * @param {number} topBound
+ * @param {number} [saveBoost]
  */
-function getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY) {
+function getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY, topBound, saveBoost = 1) {
   const fallPerFrame = POWERUP_FALL_SPEED * SUB_STEPS;
   const center = canvasWidth / 2 - paddleWidth / 2;
 
-  // Chase a power-up only when we can realistically reach it in time
+  const alive = balls.filter((b) => b.alive);
+  const threats = alive
+    .filter((b) => b.vy > 0 && b.y < paddleContactY)
+    .map((b) => ({
+      ball: b,
+      time: (paddleContactY - b.y) / Math.max(b.vy, 0.1),
+      intercept: predictBallInterceptX(b, paddleY, canvasWidth, topBound),
+    }))
+    .sort((a, b) => a.time - b.time);
+
+  // Always prioritize saving the closest falling ball
+  if (threats.length > 0) {
+    const closest = threats[0];
+    return { x: closest.intercept - paddleWidth / 2 };
+  }
+
+  // Power-ups only when no ball is falling toward the paddle
   let bestPu = /** @type {PowerUp | null} */ (null);
   let bestPuFrames = Infinity;
   for (const pu of powerUps) {
     if (pu.y >= paddleY - 2) continue;
     const frames = (paddleY - pu.y) / fallPerFrame;
     if (frames > POWERUP_CHASE_FRAMES) continue;
-    if (!paddleCanReach(paddleX, paddleWidth, pu.x, canvasWidth, frames)) continue;
+    if (!paddleCanReach(paddleX, paddleWidth, pu.x, canvasWidth, frames, saveBoost)) continue;
     if (frames < bestPuFrames) {
       bestPuFrames = frames;
       bestPu = pu;
@@ -592,32 +702,11 @@ function getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasW
     return { x: bestPu.x - paddleWidth / 2 };
   }
 
-  const alive = balls.filter((b) => b.alive);
-  const falling = alive.filter((b) => b.vy > 0 && b.y < paddleContactY);
-  if (falling.length > 0) {
-    let bestBall = falling[0];
-    let bestTime = (paddleContactY - bestBall.y) / Math.max(bestBall.vy, 0.1);
-    for (const b of falling.slice(1)) {
-      const t = (paddleContactY - b.y) / Math.max(b.vy, 0.1);
-      if (t < bestTime) {
-        bestTime = t;
-        bestBall = b;
-      }
-    }
-    if (bestTime <= BALL_FALL_TRACK_FRAMES) {
-      const intercept = predictBallInterceptX(bestBall, paddleY, canvasWidth);
-      if (paddleCanReach(paddleX, paddleWidth, intercept, canvasWidth, bestTime)) {
-        return { x: intercept - paddleWidth / 2 };
-      }
-    }
-  }
-
-  // Ball rising or far away — drift toward current x, don't whip across the screen
   const lead = alive[0];
   if (lead) {
     const targetX = lead.x - paddleWidth / 2;
     const dist = Math.abs(clampPaddleX(targetX, paddleWidth, canvasWidth) - paddleX);
-    if (dist < canvasWidth * 0.45) {
+    if (dist < canvasWidth * 0.4) {
       return { x: targetX };
     }
   }
@@ -647,9 +736,55 @@ function sparseKeyframes(states, getValue) {
   };
 }
 
+function buildTextSegments(states, getText) {
+  /** @type {{ start: number, end: number, text: string }[]} */
+  const segments = [];
+  let prev = /** @type {string | null} */ (null);
+  let start = 0;
+  for (let f = 0; f < states.length; f++) {
+    const text = getText(f);
+    if (text !== prev) {
+      if (prev !== null) segments.push({ start, end: f - 1, text: prev });
+      start = f;
+      prev = text;
+    }
+  }
+  if (prev !== null) segments.push({ start, end: states.length - 1, text: prev });
+  return segments;
+}
+
+function buildSegmentedText(segments, x, y, fill, duration, stateCount, anchor = "start") {
+  const denom = Math.max(stateCount - 1, 1);
+  return segments.map((seg) => {
+    const t0 = (seg.start / denom).toFixed(4);
+    const t1 = (seg.end / denom).toFixed(4);
+    const isFirst = seg.start === 0;
+    const isLast = seg.end === stateCount - 1;
+    const anchorAttr = anchor !== "start" ? ` text-anchor="${anchor}"` : "";
+    if (isFirst && isLast) {
+      return `<text x="${x}" y="${y}" font-size="9" font-family="monospace" font-weight="bold" fill="${fill}"${anchorAttr}>${seg.text}</text>`;
+    }
+    let keyTimes;
+    let values;
+    if (isFirst) {
+      keyTimes = `0;${t1};${t1};1`;
+      values = "1;1;0;0";
+    } else if (isLast) {
+      keyTimes = `0;${t0};${t0};1`;
+      values = "0;0;1;1";
+    } else {
+      keyTimes = `0;${t0};${t0};${t1};${t1};1`;
+      values = "0;0;1;1;0;0";
+    }
+    return `<text x="${x}" y="${y}" font-size="9" font-family="monospace" font-weight="bold" fill="${fill}"${anchorAttr} opacity="0">${seg.text}<animate attributeName="opacity" values="${values}" keyTimes="${keyTimes}" dur="${duration}s" repeatCount="indefinite"/></text>`;
+  }).join("");
+}
+
 function buildPowerUpEl(lc, duration) {
-  const { type, xs, ys, opacity } = lc;
-  const meta = POWERUP_META[type];
+  const { type, xs, ys, opacity, xpValue } = lc;
+  const meta = type === "xp"
+    ? { label: `+${xpValue ?? 0}`, color: XP_POWERUP_COLOR }
+    : POWERUP_META[type];
   const half = POWERUP_SIZE / 2;
 
   const visible = opacity.some((o) => o === 1);
@@ -679,8 +814,9 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
   const brickColumnCount = days.length;
   const canvasWidth = brickColumnCount * (BRICK_SIZE + BRICK_GAP) + PADDING * 2 - BRICK_GAP;
   const bricksTotalHeight = 7 * (BRICK_SIZE + BRICK_GAP) - BRICK_GAP;
-  const paddleY = PADDING + bricksTotalHeight + PADDLE_BRICK_GAP;
+  const paddleY = HUD_HEIGHT + PADDING + bricksTotalHeight + PADDLE_BRICK_GAP;
   const canvasHeight = paddleY + PADDLE_HEIGHT + BALL_RADIUS + 4;
+  const hudText = themeColors.hudText ?? themeColors.paddle;
 
   const palette = themeColors.bricks;
 
@@ -692,10 +828,12 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
       if (!day) continue;
       bricks.push({
         x: c * (BRICK_SIZE + BRICK_GAP) + PADDING,
-        y: r * (BRICK_SIZE + BRICK_GAP) + PADDING,
+        y: HUD_HEIGHT + r * (BRICK_SIZE + BRICK_GAP) + PADDING,
         colorClass: `c${day.level}`,
         status: "visible",
         hasCommit: day.contributionCount > 0,
+        contributionCount: day.contributionCount,
+        level: day.level,
         index: bricks.length,
       });
     }
@@ -771,6 +909,7 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
         if (!pu) continue;
         puLifecycles.set(id, {
           type: pu.type,
+          xpValue: pu.xpValue,
           xs: new Array(states.length).fill(-100),
           ys: new Array(states.length).fill(-100),
           opacity: new Array(states.length).fill(0),
@@ -790,7 +929,17 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
 
   const powerUpEls = [...puLifecycles.values()].map((lc) => buildPowerUpEl(lc, duration)).join("");
 
-  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${ballEls.join("")}${paddle}${powerUpEls}</svg>`);
+  const livesSegments = buildTextSegments(states, (f) => {
+    const s = states[f];
+    const hearts = "♥".repeat(s.lives) + "♡".repeat(Math.max(0, STARTING_LIVES - s.lives));
+    return s.gameOver ? `${hearts} GAME OVER` : hearts;
+  });
+  const scoreSegments = buildTextSegments(states, (f) => `${states[f].score} pts`);
+  const xpSegments = buildTextSegments(states, (f) => `XP ${states[f].xp}`);
+
+  const hud = `<g>${buildSegmentedText(livesSegments, PADDING, 11, hudText, duration, states.length)}${buildSegmentedText(scoreSegments, canvasWidth - PADDING, 11, hudText, duration, states.length, "end")}${buildSegmentedText(xpSegments, canvasWidth / 2, 11, hudText, duration, states.length, "middle")}</g>`;
+
+  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${hud}${brickSymbol}${brickUses}${ballEls.join("")}${paddle}${powerUpEls}</svg>`);
 }
 
 async function main() {
@@ -806,6 +955,7 @@ async function main() {
   console.log(`Fetching contributions for ${username}...`);
   const days = await fetchContributions(username, token);
   const seed = days.reduce((acc, week) => acc + week.reduce((w, d) => w + (d?.contributionCount ?? 0), 0), 0);
+  const runSeed = seed ^ (Date.now() % 100000);
 
   mkdirSync(outputPath, { recursive: true });
 
@@ -813,7 +963,7 @@ async function main() {
     for (const mode of ["light", "dark"]) {
       const filename = `breakout-${themeId}-${mode}.svg`;
       console.log(`Generating ${filename}...`);
-      const svg = buildSVG(days, theme[mode], true, seed + themeId.length);
+      const svg = buildSVG(days, theme[mode], true, runSeed + themeId.length * 31 + mode.length);
       writeFileSync(join(outputPath, filename), svg);
     }
   }
