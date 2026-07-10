@@ -14,15 +14,15 @@ const BRICK_SIZE = 12;
 const BRICK_GAP = 3;
 const BRICK_RADIUS = 3;
 const POWERUP_SIZE = 11;
-const POWERUP_FALL_SPEED = 1.8;
+const POWERUP_FALL_SPEED = 1.4;
 const POWERUP_SPAWN_INTERVAL = 5;
 
 // Simulation
-const BALL_SPEED = 8;
-const FAST_SPEED = 11;
-const SLOW_SPEED = 6;
+const BALL_SPEED = 6;
+const FAST_SPEED = 8.5;
+const SLOW_SPEED = 4.5;
 const SUB_STEPS = 8;
-const SECONDS_PER_FRAME = 1 / 30;
+const SECONDS_PER_FRAME = 1 / 24;
 const FRAME_SAMPLE = 4;
 const MAX_FRAMES = 40000;
 const MAX_BALLS = 4;
@@ -32,9 +32,10 @@ const MIN_VY_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
 const WIDE_DURATION = 360;
 const FAST_DURATION = 240;
 const SLOW_DURATION = 240;
-const PADDLE_SPEED_POWERUP = 0.82;
-const PADDLE_SPEED_BALL_FALLING = 0.5;
-const PADDLE_SPEED_BALL_TRACK = 0.32;
+const PADDLE_MAX_SPEED = 3.8;
+const PADDLE_ACCEL = 0.22;
+const BALL_FALL_TRACK_FRAMES = 90;
+const POWERUP_CHASE_FRAMES = 55;
 
 /** @typedef {'multi' | 'wide' | 'fast' | 'slow'} PowerUpType */
 
@@ -203,9 +204,9 @@ function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
 
 /**
  * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean, index: number }} Brick
- * @typedef {{ x: number, y: number, vx: number, vy: number, speed: number }} Ball
+ * @typedef {{ id: number, x: number, y: number, vx: number, vy: number, speed: number, alive: boolean }} Ball
  * @typedef {{ x: number, y: number, type: PowerUpType, id: number }} PowerUp
- * @typedef {{ paddleX: number, paddleWidth: number, balls: {x:number,y:number}[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
+ * @typedef {{ paddleX: number, paddleWidth: number, balls: {id:number,x:number,y:number,alive:boolean}[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
  */
 
 /**
@@ -220,13 +221,16 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   const paddleContactY = paddleY - BALL_RADIUS;
   const paddleBottom = paddleY + PADDLE_HEIGHT;
   const launchAngle = -Math.PI / 4 + ((seed % 7) - 3) * 0.04;
+  let nextBallId = 0;
   /** @type {Ball[]} */
   let balls = [{
+    id: nextBallId++,
     x: canvasWidth / 2,
     y: paddleContactY - 2,
     vx: BALL_SPEED * Math.cos(launchAngle),
     vy: BALL_SPEED * Math.sin(launchAngle),
     speed: BALL_SPEED,
+    alive: true,
   }];
 
   const simulatedBricks = bricks.map((b, i) => ({ ...b, index: i }));
@@ -236,6 +240,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   let powerUps = [];
   let powerUpId = 0;
   let paddleX = (canvasWidth - PADDLE_WIDTH) / 2;
+  let paddleVel = 0;
   let paddleWidth = PADDLE_WIDTH;
   let wideUntil = 0;
   let speedMod = /** @type {{ type: 'fast'|'slow'|null, until: number }} */ ({ type: null, until: 0 });
@@ -270,20 +275,26 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   };
 
   const applyPowerUp = (/** @type {PowerUpType} */ type) => {
-    if (type === "multi" && balls.length < MAX_BALLS) {
-      const src = balls[0];
-      const angles = [-0.5, 0.5];
+    if (type === "multi") {
+      const alive = balls.filter((b) => b.alive);
+      const src = alive[0] ?? balls[0];
+      const spawnX = paddleX + paddleWidth / 2;
+      const spawnY = paddleContactY - 2;
+      const angles = [-0.75, 0.75, -1.15, 1.15];
       for (const a of angles) {
-        if (balls.length >= MAX_BALLS) break;
+        if (balls.filter((b) => b.alive).length >= MAX_BALLS) break;
         const speed = getBallSpeed(src);
         balls.push({
-          x: paddleX + paddleWidth / 2,
-          y: paddleContactY - 2,
+          id: nextBallId++,
+          x: spawnX,
+          y: spawnY,
           vx: speed * Math.sin(a),
           vy: -speed * Math.cos(a),
           speed: BALL_SPEED,
+          alive: true,
         });
       }
+      recordExtra = true;
     } else if (type === "wide") {
       wideUntil = frame + WIDE_DURATION;
     } else if (type === "fast") {
@@ -304,24 +315,39 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   const respawnBall = () => {
     const angle = -Math.PI / 4;
     balls = [{
+      id: nextBallId++,
       x: paddleX + paddleWidth / 2,
       y: paddleContactY - 2,
       vx: BALL_SPEED * Math.cos(angle),
       vy: BALL_SPEED * Math.sin(angle),
       speed: BALL_SPEED,
+      alive: true,
     }];
+  };
+
+  const movePaddleToward = (/** @type {number} */ targetX) => {
+    const clamped = clampPaddleX(targetX, paddleWidth, canvasWidth);
+    const dx = clamped - paddleX;
+    const maxStep = PADDLE_MAX_SPEED / SUB_STEPS;
+    const desiredVel = Math.abs(dx) <= maxStep
+      ? dx
+      : Math.sign(dx) * maxStep;
+    paddleVel += (desiredVel - paddleVel) * PADDLE_ACCEL;
+    paddleVel = Math.max(-maxStep, Math.min(maxStep, paddleVel));
+    paddleX = clampPaddleX(paddleX + paddleVel, paddleWidth, canvasWidth);
+    if (Math.abs(dx) < 0.05) paddleVel *= 0.5;
   };
 
   while (simulatedBricks.some(breakable) && frame < MAX_FRAMES) {
     paddleWidth = frame < wideUntil ? PADDLE_WIDTH * PADDLE_WIDE_SCALE : PADDLE_WIDTH;
 
     for (let sub = 0; sub < SUB_STEPS; sub++) {
-      // Update paddle each sub-step — rush power-ups, then predict ball intercept
-      const target = getPaddleTarget(powerUps, balls, paddleY, paddleWidth, canvasWidth, paddleContactY);
-      paddleX += (clampPaddleX(target.x, paddleWidth, canvasWidth) - paddleX) * (target.speed / SUB_STEPS + 0.08);
+      const target = getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY);
+      movePaddleToward(target.x);
 
       for (let bi = 0; bi < balls.length; bi++) {
         const ball = balls[bi];
+        if (!ball.alive) continue;
         const speed = getBallSpeed(ball);
         const stepVx = ball.vx / SUB_STEPS;
         const stepVy = ball.vy / SUB_STEPS;
@@ -382,7 +408,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           if (ball.vy > 0) ball.vy = -Math.abs(ball.vy);
           recordExtra = true;
         } else if (ball.y + BALL_RADIUS > paddleBottom) {
-          // Fell past paddle — remove
+          ball.alive = false;
           ball.y = Infinity;
         }
 
@@ -441,18 +467,19 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         return pu.y < canvasHeight + POWERUP_SIZE;
       });
 
-      balls = balls.filter((b) => b.y !== Infinity && b.y + BALL_RADIUS <= paddleBottom + 1);
     }
 
-    if (balls.length === 0) respawnBall();
+    if (balls.every((b) => !b.alive)) respawnBall();
 
     if (frame % FRAME_SAMPLE === 0 || recordExtra) {
       frameHistory.push({
         paddleX,
         paddleWidth,
         balls: balls.map((b) => ({
+          id: b.id,
           x: b.x,
           y: Math.min(b.y, paddleContactY),
+          alive: b.alive,
         })),
         bricks: simulatedBricks.map((b) => b.status),
         powerUps: powerUps.map((pu) => ({ x: pu.x, y: pu.y, type: pu.type, id: pu.id })),
@@ -506,38 +533,45 @@ function predictBallInterceptX(ball, paddleY, canvasWidth) {
   return Math.max(left, Math.min(right, x));
 }
 
+function paddleCanReach(paddleX, paddleWidth, targetCenterX, canvasWidth, framesLeft) {
+  const targetX = clampPaddleX(targetCenterX - paddleWidth / 2, paddleWidth, canvasWidth);
+  const dist = Math.abs(targetX - paddleX);
+  return dist <= PADDLE_MAX_SPEED * framesLeft + paddleWidth * 0.15;
+}
+
 /**
  * @param {PowerUp[]} powerUps
  * @param {Ball[]} balls
+ * @param {number} paddleX
  * @param {number} paddleY
  * @param {number} paddleWidth
  * @param {number} canvasWidth
  * @param {number} paddleContactY
  */
-function getPaddleTarget(powerUps, balls, paddleY, paddleWidth, canvasWidth, paddleContactY) {
+function getPaddleTarget(powerUps, balls, paddleX, paddleY, paddleWidth, canvasWidth, paddleContactY) {
   const fallPerFrame = POWERUP_FALL_SPEED * SUB_STEPS;
+  const center = canvasWidth / 2 - paddleWidth / 2;
 
-  // Rush to the power-up that lands soonest
+  // Chase a power-up only when we can realistically reach it in time
   let bestPu = /** @type {PowerUp | null} */ (null);
   let bestPuFrames = Infinity;
   for (const pu of powerUps) {
     if (pu.y >= paddleY - 2) continue;
     const frames = (paddleY - pu.y) / fallPerFrame;
+    if (frames > POWERUP_CHASE_FRAMES) continue;
+    if (!paddleCanReach(paddleX, paddleWidth, pu.x, canvasWidth, frames)) continue;
     if (frames < bestPuFrames) {
       bestPuFrames = frames;
       bestPu = pu;
     }
   }
 
-  if (bestPu && bestPuFrames < 200) {
-    return {
-      x: bestPu.x - paddleWidth / 2,
-      speed: PADDLE_SPEED_POWERUP,
-    };
+  if (bestPu) {
+    return { x: bestPu.x - paddleWidth / 2 };
   }
 
-  // Predict where the ball will be when it reaches the paddle
-  const falling = balls.filter((b) => b.vy > 0 && b.y < paddleContactY);
+  const alive = balls.filter((b) => b.alive);
+  const falling = alive.filter((b) => b.vy > 0 && b.y < paddleContactY);
   if (falling.length > 0) {
     let bestBall = falling[0];
     let bestTime = (paddleContactY - bestBall.y) / Math.max(bestBall.vy, 0.1);
@@ -548,22 +582,25 @@ function getPaddleTarget(powerUps, balls, paddleY, paddleWidth, canvasWidth, pad
         bestBall = b;
       }
     }
-    return {
-      x: predictBallInterceptX(bestBall, paddleY, canvasWidth) - paddleWidth / 2,
-      speed: PADDLE_SPEED_BALL_FALLING,
-    };
+    if (bestTime <= BALL_FALL_TRACK_FRAMES) {
+      const intercept = predictBallInterceptX(bestBall, paddleY, canvasWidth);
+      if (paddleCanReach(paddleX, paddleWidth, intercept, canvasWidth, bestTime)) {
+        return { x: intercept - paddleWidth / 2 };
+      }
+    }
   }
 
-  // Ball heading up — track with lead so we're ready when it comes back down
-  const lead = balls[0];
+  // Ball rising or far away — drift toward current x, don't whip across the screen
+  const lead = alive[0];
   if (lead) {
-    return {
-      x: predictBallInterceptX(lead, paddleY, canvasWidth) - paddleWidth / 2,
-      speed: PADDLE_SPEED_BALL_TRACK,
-    };
+    const targetX = lead.x - paddleWidth / 2;
+    const dist = Math.abs(clampPaddleX(targetX, paddleWidth, canvasWidth) - paddleX);
+    if (dist < canvasWidth * 0.45) {
+      return { x: targetX };
+    }
   }
 
-  return { x: canvasWidth / 2 - paddleWidth / 2, speed: PADDLE_SPEED_BALL_TRACK };
+  return { x: center };
 }
 
 function clampPaddleX(x, paddleWidth, canvasWidth) {
@@ -648,7 +685,13 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
   if (states.length < 2) throw new Error("Simulation produced too few frames");
 
   const duration = states.length * SECONDS_PER_FRAME;
-  const maxBalls = Math.max(...states.map((s) => s.balls.length), 1);
+
+  /** @type {Set<number>} */
+  const ballIds = new Set();
+  for (const s of states) {
+    for (const b of s.balls) ballIds.add(b.id);
+  }
+  const sortedBallIds = [...ballIds].sort((a, b) => a - b);
 
   const paddleXs = states.map((s) => s.paddleX);
   const paddleWidths = states.map((s) => s.paddleWidth);
@@ -686,17 +729,21 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
 
   /** @type {string[]} */
   const ballEls = [];
-  for (let bi = 0; bi < maxBalls; bi++) {
-    const cx = states.map((s) => s.balls[bi]?.x ?? -100);
+  for (const ballId of sortedBallIds) {
+    const cx = states.map((s) => s.balls.find((b) => b.id === ballId)?.x ?? -100);
     const cy = states.map((s) => {
-      const y = s.balls[bi]?.y ?? -100;
-      return y > 0 ? Math.min(y, paddleContactY) : y;
+      const ball = s.balls.find((b) => b.id === ballId);
+      if (!ball || !ball.alive) return -100;
+      return Math.min(ball.y, paddleContactY);
     });
-    const opacityAnim = sparseKeyframes(states, (f) => (states[f].balls[bi] ? 1 : 0));
+    const opacityAnim = sparseKeyframes(states, (f) => {
+      const ball = states[f].balls.find((b) => b.id === ballId);
+      return ball?.alive ? 1 : 0;
+    });
     const opacityAttr = opacityAnim
       ? `<animate attributeName="opacity" values="${opacityAnim.values}" keyTimes="${opacityAnim.keyTimes}" dur="${duration}s" repeatCount="indefinite"/>`
       : "";
-    const initialOpacity = states[0].balls[bi] ? 1 : 0;
+    const initialOpacity = states[0].balls.find((b) => b.id === ballId)?.alive ? 1 : 0;
     ballEls.push(`<circle r="${BALL_RADIUS}" fill="${themeColors.ball}" opacity="${initialOpacity}"><animate attributeName="cx" values="${animValues(cx)}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="cy" values="${animValues(cy)}" dur="${duration}s" repeatCount="indefinite"/>${opacityAttr}</circle>`);
   }
 
