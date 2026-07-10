@@ -1,11 +1,3 @@
-# Hi there 👋
-
-My contribution graph, turned into a Breakout game — each brick is a day of commits.
-
-### Pick a theme
-
-Click a theme to switch the game below.
-
 <details name="breakout-theme" open>
 <summary><kbd>🟢 GitHub</kbd></summary>
 <br>
