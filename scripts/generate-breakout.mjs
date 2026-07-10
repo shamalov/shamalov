@@ -145,16 +145,28 @@ function clampVelocity(vx, vy, speed, biasX = 0) {
   if (Math.abs(nvx) < minVx) {
     const sign = nvx !== 0 ? Math.sign(nvx) : (biasX !== 0 ? Math.sign(biasX) : 1);
     nvx = sign * minVx;
-    nvy = Math.sign(nvy || -1) * Math.sqrt(speed * speed - nvx * nvx);
+    const rem = speed * speed - nvx * nvx;
+    nvy = Math.sign(nvy || -1) * Math.sqrt(Math.max(rem, minVy * minVy));
   }
 
   if (Math.abs(nvy) < minVy) {
-    const sign = nvy !== 0 ? Math.sign(nvy) : -1;
+    const sign = nvy !== 0 ? Math.sign(nvy) : (biasX !== 0 ? -Math.sign(biasX) : -1);
     nvy = sign * minVy;
-    nvx = Math.sign(nvx || 1) * Math.sqrt(speed * speed - nvy * nvy);
+    const rem = speed * speed - nvy * nvy;
+    nvx = Math.sign(nvx || biasX || 1) * Math.sqrt(Math.max(rem, minVx * minVx));
   }
 
   return normalizeVelocity(nvx, nvy, speed);
+}
+
+/** Prevent horizontal-only trajectories after any collision. */
+function deflatVelocity(vx, vy, speed, preferDown = true) {
+  const minVy = speed * MIN_VY_RATIO;
+  if (Math.abs(vy) >= minVy * 0.9) return { vx, vy };
+  const sign = vy !== 0 ? Math.sign(vy) : (preferDown ? 1 : -1);
+  const nvy = sign * minVy;
+  const nvx = Math.sign(vx || 1) * Math.sqrt(Math.max(speed * speed - nvy * nvy, 0));
+  return clampVelocity(nvx, nvy, speed, vx);
 }
 
 function circleOverlapsRect(cx, cy, r, rx, ry, rw, rh) {
@@ -181,6 +193,9 @@ function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
   const overlapRight = rx + rw - (cx - r);
   const overlapTop = cy + r - ry;
   const overlapBottom = ry + rh - (cy - r);
+
+  const absVx = Math.abs(vx);
+  const absVy = Math.abs(vy);
   const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
 
   let nx = 0;
@@ -189,30 +204,42 @@ function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
   let x = cx;
   let y = cy;
 
-  if (minOverlap === overlapLeft) {
-    side = "left";
-    nx = -1;
-    x = rx - r - 0.01;
+  // Prefer collision axis aligned with velocity — stops horizontal gutter traps
+  if (absVx > absVy * 1.1) {
+    if (vx > 0) {
+      side = "right"; nx = 1; x = rx + rw + r + 0.01;
+    } else {
+      side = "left"; nx = -1; x = rx - r - 0.01;
+    }
+  } else if (absVy > absVx * 1.1) {
+    if (vy > 0) {
+      side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
+    } else {
+      side = "top"; ny = -1; y = ry - r - 0.01;
+    }
+  } else if (minOverlap === overlapLeft) {
+    side = "left"; nx = -1; x = rx - r - 0.01;
   } else if (minOverlap === overlapRight) {
-    side = "right";
-    nx = 1;
-    x = rx + rw + r + 0.01;
+    side = "right"; nx = 1; x = rx + rw + r + 0.01;
   } else if (minOverlap === overlapTop) {
-    side = "top";
-    ny = -1;
-    y = ry - r - 0.01;
+    side = "top"; ny = -1; y = ry - r - 0.01;
   } else {
-    side = "bottom";
-    ny = 1;
-    y = ry + rh + r + 0.01;
+    side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
   }
 
-  // Ignore if already separating from this surface
   if (vx * nx + vy * ny >= 0) return null;
 
   const dot = vx * nx + vy * ny;
-  const rvx = vx - 2 * dot * nx;
-  const rvy = vy - 2 * dot * ny;
+  let rvx = vx - 2 * dot * nx;
+  let rvy = vy - 2 * dot * ny;
+
+  // Side bounces must gain vertical component — never slide horizontally
+  if (side === "left" || side === "right") {
+    const speed = Math.hypot(vx, vy) || BALL_SPEED;
+    const flat = deflatVelocity(rvx, rvy, speed, true);
+    rvx = flat.vx;
+    rvy = flat.vy;
+  }
 
   return { side, x, y, vx: rvx, vy: rvy };
 }
@@ -456,11 +483,13 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         if (ball.x - BALL_RADIUS < PADDING && prevX - BALL_RADIUS >= PADDING) {
           ball.x = PADDING + BALL_RADIUS;
           ball.vx = Math.abs(ball.vx);
-          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, 1));
+          const cv = clampVelocity(ball.vx, ball.vy, speed, 1);
+          ({ vx: ball.vx, vy: ball.vy } = deflatVelocity(cv.vx, cv.vy, speed, true));
         } else if (ball.x + BALL_RADIUS > canvasWidth - PADDING && prevX + BALL_RADIUS <= canvasWidth - PADDING) {
           ball.x = canvasWidth - PADDING - BALL_RADIUS;
           ball.vx = -Math.abs(ball.vx);
-          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, -1));
+          const cv = clampVelocity(ball.vx, ball.vy, speed, -1);
+          ({ vx: ball.vx, vy: ball.vy } = deflatVelocity(cv.vx, cv.vy, speed, true));
         }
 
         if (ball.y - BALL_RADIUS < topBound && prevY - BALL_RADIUS >= topBound) {
@@ -498,9 +527,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2));
           recordExtra = true;
         } else if (horizOnPaddle && ball.y > paddleContactY) {
-          // Tunneled into paddle without a clean bounce — snap up
           ball.y = paddleContactY - 0.01;
           if (ball.vy > 0) ball.vy = -Math.abs(ball.vy);
+          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(
+            ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2,
+          ));
           recordExtra = true;
         } else if (ball.y + BALL_RADIUS > paddleBottom) {
           ball.alive = false;
@@ -532,7 +563,12 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ball.y = bestHit.hit.y;
           ball.vx = bestHit.hit.vx;
           ball.vy = bestHit.hit.vy;
-          ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - (brick.x + BRICK_SIZE / 2)));
+          const cv = clampVelocity(
+            ball.vx, ball.vy, speed, ball.x - (brick.x + BRICK_SIZE / 2),
+          );
+          ({ vx: ball.vx, vy: ball.vy } = deflatVelocity(
+            cv.vx, cv.vy, speed, bestHit.hit.side !== "top",
+          ));
 
           if (breakable(brick)) {
             brick.status = "hidden";
@@ -547,6 +583,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           const maxY = horizOnPaddle ? paddleContactY : paddleBottom;
           ball.y = Math.max(topBound, Math.min(maxY, ball.y));
         }
+
+        // Safety net: never allow a purely horizontal trajectory
+        const flat = deflatVelocity(ball.vx, ball.vy, speed, ball.y < paddleY);
+        ball.vx = flat.vx;
+        ball.vy = flat.vy;
       }
 
       // Fall power-ups
