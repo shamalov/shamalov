@@ -42,7 +42,3 @@
   <img src="https://raw.githubusercontent.com/shamalov/shamalov/github-breakout/images/breakout-retro-dark.svg#gh-dark-mode-only" alt="Retro theme breakout" />
 </div>
 </details>
-
-<br>
-
-<sub>Custom physics engine with sub-step collision detection, angle-based paddle reflection, and predictive paddle tracking. Inspired by <a href="https://github.com/cyprieng/github-breakout">cyprieng/github-breakout</a>.</sub>
