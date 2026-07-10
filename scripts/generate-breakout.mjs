@@ -196,7 +196,6 @@ function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
 
   const absVx = Math.abs(vx);
   const absVy = Math.abs(vy);
-  const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
 
   let nx = 0;
   let ny = 0;
@@ -204,24 +203,24 @@ function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
   let x = cx;
   let y = cy;
 
-  // Prefer collision axis aligned with velocity — stops horizontal gutter traps
+  // Pick axis by velocity (prevents gutter traps), face by penetration depth
   if (absVx > absVy * 1.1) {
-    if (vx > 0) {
-      side = "right"; nx = 1; x = rx + rw + r + 0.01;
-    } else {
+    if (overlapLeft < overlapRight) {
       side = "left"; nx = -1; x = rx - r - 0.01;
+    } else {
+      side = "right"; nx = 1; x = rx + rw + r + 0.01;
     }
   } else if (absVy > absVx * 1.1) {
-    if (vy > 0) {
-      side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
-    } else {
+    if (overlapTop < overlapBottom) {
       side = "top"; ny = -1; y = ry - r - 0.01;
+    } else {
+      side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
     }
-  } else if (minOverlap === overlapLeft) {
+  } else if (overlapLeft <= overlapRight && overlapLeft <= overlapTop && overlapLeft <= overlapBottom) {
     side = "left"; nx = -1; x = rx - r - 0.01;
-  } else if (minOverlap === overlapRight) {
+  } else if (overlapRight <= overlapTop && overlapRight <= overlapBottom) {
     side = "right"; nx = 1; x = rx + rw + r + 0.01;
-  } else if (minOverlap === overlapTop) {
+  } else if (overlapTop <= overlapBottom) {
     side = "top"; ny = -1; y = ry - r - 0.01;
   } else {
     side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
