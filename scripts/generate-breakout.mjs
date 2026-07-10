@@ -32,6 +32,9 @@ const MIN_VY_RATIO = Math.sin(MIN_BOUNCE_ANGLE);
 const WIDE_DURATION = 360;
 const FAST_DURATION = 240;
 const SLOW_DURATION = 240;
+const PADDLE_SPEED_POWERUP = 0.82;
+const PADDLE_SPEED_BALL_FALLING = 0.5;
+const PADDLE_SPEED_BALL_TRACK = 0.32;
 
 /** @typedef {'multi' | 'wide' | 'fast' | 'slow'} PowerUpType */
 
@@ -312,11 +315,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   while (simulatedBricks.some(breakable) && frame < MAX_FRAMES) {
     paddleWidth = frame < wideUntil ? PADDLE_WIDTH * PADDLE_WIDE_SCALE : PADDLE_WIDTH;
 
-    const leadBall = balls[0];
-    const targetX = (leadBall?.x ?? canvasWidth / 2) + (leadBall?.vx ?? 0) * 3 - paddleWidth / 2;
-    paddleX += (Math.max(PADDING, Math.min(canvasWidth - PADDING - paddleWidth, targetX)) - paddleX) * 0.18;
-
     for (let sub = 0; sub < SUB_STEPS; sub++) {
+      // Update paddle each sub-step — rush power-ups, then predict ball intercept
+      const target = getPaddleTarget(powerUps, balls, paddleY, paddleWidth, canvasWidth, paddleContactY);
+      paddleX += (clampPaddleX(target.x, paddleWidth, canvasWidth) - paddleX) * (target.speed / SUB_STEPS + 0.08);
+
       for (let bi = 0; bi < balls.length; bi++) {
         const ball = balls[bi];
         const speed = getBallSpeed(ball);
@@ -463,7 +466,110 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   return frameHistory;
 }
 
-function sparseKeyframes(states, getValue, defaultValue = 0) {
+function predictBallInterceptX(ball, paddleY, canvasWidth) {
+  const left = PADDING + BALL_RADIUS;
+  const right = canvasWidth - PADDING - BALL_RADIUS;
+  const top = PADDING + BALL_RADIUS;
+
+  if (ball.vy > 0) {
+    let t = (paddleY - ball.y - BALL_RADIUS) / ball.vy;
+    if (t <= 0) return ball.x;
+    let x = ball.x;
+    let vx = ball.vx;
+    while (t > 0) {
+      const toWall = vx > 0 ? (right - x) / vx : vx < 0 ? (left - x) / vx : Infinity;
+      if (!isFinite(toWall) || toWall >= t) {
+        return Math.max(left, Math.min(right, x + vx * t));
+      }
+      t -= toWall;
+      x += vx * toWall;
+      vx = -vx;
+    }
+    return Math.max(left, Math.min(right, x));
+  }
+
+  // Ball rising — simulate forward until it returns to the paddle
+  let x = ball.x;
+  let y = ball.y;
+  let vx = ball.vx;
+  let vy = ball.vy;
+  for (let i = 0; i < 600; i++) {
+    if (vy > 0 && y + BALL_RADIUS >= paddleY - 0.5) {
+      return Math.max(left, Math.min(right, x));
+    }
+    x += vx;
+    y += vy;
+    if (x < left) { x = left; vx = Math.abs(vx); }
+    else if (x > right) { x = right; vx = -Math.abs(vx); }
+    if (y < top) { y = top; vy = Math.abs(vy); }
+  }
+  return Math.max(left, Math.min(right, x));
+}
+
+/**
+ * @param {PowerUp[]} powerUps
+ * @param {Ball[]} balls
+ * @param {number} paddleY
+ * @param {number} paddleWidth
+ * @param {number} canvasWidth
+ * @param {number} paddleContactY
+ */
+function getPaddleTarget(powerUps, balls, paddleY, paddleWidth, canvasWidth, paddleContactY) {
+  const fallPerFrame = POWERUP_FALL_SPEED * SUB_STEPS;
+
+  // Rush to the power-up that lands soonest
+  let bestPu = /** @type {PowerUp | null} */ (null);
+  let bestPuFrames = Infinity;
+  for (const pu of powerUps) {
+    if (pu.y >= paddleY - 2) continue;
+    const frames = (paddleY - pu.y) / fallPerFrame;
+    if (frames < bestPuFrames) {
+      bestPuFrames = frames;
+      bestPu = pu;
+    }
+  }
+
+  if (bestPu && bestPuFrames < 200) {
+    return {
+      x: bestPu.x - paddleWidth / 2,
+      speed: PADDLE_SPEED_POWERUP,
+    };
+  }
+
+  // Predict where the ball will be when it reaches the paddle
+  const falling = balls.filter((b) => b.vy > 0 && b.y < paddleContactY);
+  if (falling.length > 0) {
+    let bestBall = falling[0];
+    let bestTime = (paddleContactY - bestBall.y) / Math.max(bestBall.vy, 0.1);
+    for (const b of falling.slice(1)) {
+      const t = (paddleContactY - b.y) / Math.max(b.vy, 0.1);
+      if (t < bestTime) {
+        bestTime = t;
+        bestBall = b;
+      }
+    }
+    return {
+      x: predictBallInterceptX(bestBall, paddleY, canvasWidth) - paddleWidth / 2,
+      speed: PADDLE_SPEED_BALL_FALLING,
+    };
+  }
+
+  // Ball heading up — track with lead so we're ready when it comes back down
+  const lead = balls[0];
+  if (lead) {
+    return {
+      x: predictBallInterceptX(lead, paddleY, canvasWidth) - paddleWidth / 2,
+      speed: PADDLE_SPEED_BALL_TRACK,
+    };
+  }
+
+  return { x: canvasWidth / 2 - paddleWidth / 2, speed: PADDLE_SPEED_BALL_TRACK };
+}
+
+function clampPaddleX(x, paddleWidth, canvasWidth) {
+  return Math.max(PADDING, Math.min(canvasWidth - PADDING - paddleWidth, x));
+}
+function sparseKeyframes(states, getValue) {
   /** @type {{ f: number, v: number }[]} */
   const changes = [];
   let prev = /** @type {number | null} */ (null);
