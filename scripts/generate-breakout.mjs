@@ -204,9 +204,10 @@ function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
 
 /**
  * @typedef {{ x: number, y: number, status: "visible" | "hidden", colorClass: string, hasCommit: boolean, index: number }} Brick
- * @typedef {{ id: number, x: number, y: number, vx: number, vy: number, speed: number, alive: boolean }} Ball
+ * @typedef {{ id: number, slot: number, x: number, y: number, vx: number, vy: number, speed: number, alive: boolean }} Ball
  * @typedef {{ x: number, y: number, type: PowerUpType, id: number }} PowerUp
- * @typedef {{ paddleX: number, paddleWidth: number, balls: {id:number,x:number,y:number,alive:boolean}[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
+ * @typedef {{ slot: number, x: number, y: number, alive: boolean }} BallSnapshot
+ * @typedef {{ paddleX: number, paddleWidth: number, balls: BallSnapshot[], bricks: ("visible"|"hidden")[], powerUps: {x:number,y:number,type:PowerUpType}[] }} FrameState
  */
 
 /**
@@ -222,9 +223,17 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   const paddleBottom = paddleY + PADDLE_HEIGHT;
   const launchAngle = -Math.PI / 4 + ((seed % 7) - 3) * 0.04;
   let nextBallId = 0;
+  /** @type {number[]} */
+  let freeSlots = [1, 2, 3];
+  const allocSlot = () => (freeSlots.length > 0 ? /** @type {number} */ (freeSlots.pop()) : null);
+  const releaseSlot = (/** @type {number} */ slot) => {
+    if (slot > 0 && !freeSlots.includes(slot)) freeSlots.push(slot);
+  };
+
   /** @type {Ball[]} */
   let balls = [{
     id: nextBallId++,
+    slot: 0,
     x: canvasWidth / 2,
     y: paddleContactY - 2,
     vx: BALL_SPEED * Math.cos(launchAngle),
@@ -283,9 +292,12 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       const angles = [-0.75, 0.75, -1.15, 1.15];
       for (const a of angles) {
         if (balls.filter((b) => b.alive).length >= MAX_BALLS) break;
+        const slot = allocSlot();
+        if (slot === null) break;
         const speed = getBallSpeed(src);
         balls.push({
           id: nextBallId++,
+          slot,
           x: spawnX,
           y: spawnY,
           vx: speed * Math.sin(a),
@@ -314,8 +326,10 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
 
   const respawnBall = () => {
     const angle = -Math.PI / 4;
+    freeSlots = [1, 2, 3];
     balls = [{
       id: nextBallId++,
+      slot: 0,
       x: paddleX + paddleWidth / 2,
       y: paddleContactY - 2,
       vx: BALL_SPEED * Math.cos(angle),
@@ -324,6 +338,18 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       alive: true,
     }];
   };
+
+  const snapshotBalls = () =>
+    Array.from({ length: MAX_BALLS }, (_, slot) => {
+      const ball = balls.find((b) => b.alive && b.slot === slot);
+      if (!ball) return { slot, x: -100, y: -100, alive: false };
+      return {
+        slot,
+        x: ball.x,
+        y: Math.min(ball.y, paddleContactY),
+        alive: true,
+      };
+    });
 
   const movePaddleToward = (/** @type {number} */ targetX) => {
     const clamped = clampPaddleX(targetX, paddleWidth, canvasWidth);
@@ -409,6 +435,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           recordExtra = true;
         } else if (ball.y + BALL_RADIUS > paddleBottom) {
           ball.alive = false;
+          releaseSlot(ball.slot);
           ball.y = Infinity;
         }
 
@@ -475,12 +502,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
       frameHistory.push({
         paddleX,
         paddleWidth,
-        balls: balls.map((b) => ({
-          id: b.id,
-          x: b.x,
-          y: Math.min(b.y, paddleContactY),
-          alive: b.alive,
-        })),
+        balls: snapshotBalls(),
         bricks: simulatedBricks.map((b) => b.status),
         powerUps: powerUps.map((pu) => ({ x: pu.x, y: pu.y, type: pu.type, id: pu.id })),
       });
@@ -686,13 +708,6 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
 
   const duration = states.length * SECONDS_PER_FRAME;
 
-  /** @type {Set<number>} */
-  const ballIds = new Set();
-  for (const s of states) {
-    for (const b of s.balls) ballIds.add(b.id);
-  }
-  const sortedBallIds = [...ballIds].sort((a, b) => a - b);
-
   const paddleXs = states.map((s) => s.paddleX);
   const paddleWidths = states.map((s) => s.paddleWidth);
 
@@ -729,21 +744,17 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
 
   /** @type {string[]} */
   const ballEls = [];
-  for (const ballId of sortedBallIds) {
-    const cx = states.map((s) => s.balls.find((b) => b.id === ballId)?.x ?? -100);
+  for (let slot = 0; slot < MAX_BALLS; slot++) {
+    const cx = states.map((s) => s.balls[slot].x);
     const cy = states.map((s) => {
-      const ball = s.balls.find((b) => b.id === ballId);
-      if (!ball || !ball.alive) return -100;
-      return Math.min(ball.y, paddleContactY);
+      const ball = s.balls[slot];
+      return ball.alive ? ball.y : -100;
     });
-    const opacityAnim = sparseKeyframes(states, (f) => {
-      const ball = states[f].balls.find((b) => b.id === ballId);
-      return ball?.alive ? 1 : 0;
-    });
+    const opacityAnim = sparseKeyframes(states, (f) => (states[f].balls[slot].alive ? 1 : 0));
     const opacityAttr = opacityAnim
       ? `<animate attributeName="opacity" values="${opacityAnim.values}" keyTimes="${opacityAnim.keyTimes}" dur="${duration}s" repeatCount="indefinite"/>`
       : "";
-    const initialOpacity = states[0].balls.find((b) => b.id === ballId)?.alive ? 1 : 0;
+    const initialOpacity = states[0].balls[slot].alive ? 1 : 0;
     ballEls.push(`<circle r="${BALL_RADIUS}" fill="${themeColors.ball}" opacity="${initialOpacity}"><animate attributeName="cx" values="${animValues(cx)}" dur="${duration}s" repeatCount="indefinite"/><animate attributeName="cy" values="${animValues(cy)}" dur="${duration}s" repeatCount="indefinite"/>${opacityAttr}</circle>`);
   }
 
