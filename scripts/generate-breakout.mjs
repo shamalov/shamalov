@@ -8,7 +8,7 @@ const PADDLE_WIDTH = 50;
 const PADDLE_HEIGHT = 6;
 const PADDLE_RADIUS = 3;
 const PADDLE_WIDE_SCALE = 1.65;
-const PADDLE_BRICK_GAP = 100;
+const PADDLE_BRICK_GAP = 55;
 const BALL_RADIUS = 5;
 const BRICK_SIZE = 12;
 const BRICK_GAP = 3;
@@ -213,11 +213,13 @@ function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
  * @param {number} seed
  */
 function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks, seed) {
+  const paddleContactY = paddleY - BALL_RADIUS;
+  const paddleBottom = paddleY + PADDLE_HEIGHT;
   const launchAngle = -Math.PI / 4 + ((seed % 7) - 3) * 0.04;
   /** @type {Ball[]} */
   let balls = [{
     x: canvasWidth / 2,
-    y: canvasHeight - 24,
+    y: paddleContactY - 2,
     vx: BALL_SPEED * Math.cos(launchAngle),
     vy: BALL_SPEED * Math.sin(launchAngle),
     speed: BALL_SPEED,
@@ -235,6 +237,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   let speedMod = /** @type {{ type: 'fast'|'slow'|null, until: number }} */ ({ type: null, until: 0 });
   let frame = 0;
   let brokenCount = 0;
+  let recordExtra = false;
 
   const breakable = (/** @type {Brick} */ b) =>
     b.status === "visible" && (!enableGhostBricks || b.hasCommit);
@@ -270,7 +273,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         const speed = getBallSpeed(src);
         balls.push({
           x: paddleX + paddleWidth / 2,
-          y: paddleY - BALL_RADIUS - 2,
+          y: paddleContactY - 2,
           vx: speed * Math.sin(a),
           vy: -speed * Math.cos(a),
           speed: BALL_SPEED,
@@ -297,7 +300,7 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
     const angle = -Math.PI / 4;
     balls = [{
       x: paddleX + paddleWidth / 2,
-      y: paddleY - BALL_RADIUS - 2,
+      y: paddleContactY - 2,
       vx: BALL_SPEED * Math.cos(angle),
       vy: BALL_SPEED * Math.sin(angle),
       speed: BALL_SPEED,
@@ -340,21 +343,18 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - canvasWidth / 2));
         }
 
-        // Paddle — swept crossing OR overlap recovery (prevents tunneling under paddle)
-        const paddleBottom = paddleY + PADDLE_HEIGHT;
+        // Paddle collision — swept + overlap + hard ceiling
         const horizOnPaddle =
           ball.x + BALL_RADIUS > paddleX &&
           ball.x - BALL_RADIUS < paddleX + paddleWidth;
-        const prevBottom = prevY + BALL_RADIUS;
-        const currBottom = ball.y + BALL_RADIUS;
         const prevTop = prevY - BALL_RADIUS;
+        const currBottom = ball.y + BALL_RADIUS;
         const sweptPaddle =
           ball.vy > 0 &&
           horizOnPaddle &&
           prevTop < paddleBottom &&
           currBottom > paddleY;
         const insidePaddle =
-          ball.vy > 0 &&
           horizOnPaddle &&
           currBottom > paddleY &&
           ball.y - BALL_RADIUS < paddleBottom;
@@ -368,12 +368,16 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           }
           ball.vx = speed * Math.sin(angle);
           ball.vy = -speed * Math.cos(angle);
-          ball.y = paddleY - BALL_RADIUS - 0.01;
+          ball.y = paddleContactY - 0.01;
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2));
-        }
-
-        // Ball fell past paddle — remove it (no lingering under the slider)
-        if (ball.y - BALL_RADIUS > paddleBottom) {
+          recordExtra = true;
+        } else if (horizOnPaddle && ball.y > paddleContactY) {
+          // Tunneled into paddle without a clean bounce — snap up
+          ball.y = paddleContactY - 0.01;
+          if (ball.vy > 0) ball.vy = -Math.abs(ball.vy);
+          recordExtra = true;
+        } else if (ball.y + BALL_RADIUS > paddleBottom) {
+          // Fell past paddle — remove
           ball.y = Infinity;
         }
 
@@ -411,7 +415,8 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
 
         ball.x = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ball.x));
         if (ball.y !== Infinity) {
-          ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(paddleY - BALL_RADIUS, ball.y));
+          const maxY = horizOnPaddle ? paddleContactY : paddleBottom;
+          ball.y = Math.max(PADDING + BALL_RADIUS, Math.min(maxY, ball.y));
         }
       }
 
@@ -431,19 +436,23 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         return pu.y < canvasHeight + POWERUP_SIZE;
       });
 
-      balls = balls.filter((b) => b.y !== Infinity && b.y - BALL_RADIUS <= paddleY + PADDLE_HEIGHT);
+      balls = balls.filter((b) => b.y !== Infinity && b.y + BALL_RADIUS <= paddleBottom + 1);
     }
 
     if (balls.length === 0) respawnBall();
 
-    if (frame % FRAME_SAMPLE === 0) {
+    if (frame % FRAME_SAMPLE === 0 || recordExtra) {
       frameHistory.push({
         paddleX,
         paddleWidth,
-        balls: balls.map((b) => ({ x: b.x, y: b.y })),
+        balls: balls.map((b) => ({
+          x: b.x,
+          y: Math.min(b.y, paddleContactY),
+        })),
         bricks: simulatedBricks.map((b) => b.status),
         powerUps: powerUps.map((pu) => ({ x: pu.x, y: pu.y, type: pu.type, id: pu.id })),
       });
+      recordExtra = false;
     }
 
     frame++;
@@ -521,7 +530,7 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
   const canvasWidth = brickColumnCount * (BRICK_SIZE + BRICK_GAP) + PADDING * 2 - BRICK_GAP;
   const bricksTotalHeight = 7 * (BRICK_SIZE + BRICK_GAP) - BRICK_GAP;
   const paddleY = PADDING + bricksTotalHeight + PADDLE_BRICK_GAP;
-  const canvasHeight = paddleY + PADDLE_HEIGHT + PADDING + 20;
+  const canvasHeight = paddleY + PADDLE_HEIGHT + BALL_RADIUS + 4;
 
   const palette = themeColors.bricks;
 
@@ -541,6 +550,8 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
       });
     }
   }
+
+  const paddleContactY = paddleY - BALL_RADIUS;
 
   const states = simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks, seed);
   if (states.length < 2) throw new Error("Simulation produced too few frames");
@@ -586,7 +597,10 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
   const ballEls = [];
   for (let bi = 0; bi < maxBalls; bi++) {
     const cx = states.map((s) => s.balls[bi]?.x ?? -100);
-    const cy = states.map((s) => s.balls[bi]?.y ?? -100);
+    const cy = states.map((s) => {
+      const y = s.balls[bi]?.y ?? -100;
+      return y > 0 ? Math.min(y, paddleContactY) : y;
+    });
     const opacityAnim = sparseKeyframes(states, (f) => (states[f].balls[bi] ? 1 : 0));
     const opacityAttr = opacityAnim
       ? `<animate attributeName="opacity" values="${opacityAnim.values}" keyTimes="${opacityAnim.keyTimes}" dur="${duration}s" repeatCount="indefinite"/>`
@@ -617,7 +631,7 @@ function buildSVG(days, themeColors, enableGhostBricks, seed) {
 
   const powerUpEls = [...puMap.values()].map((pu) => buildPowerUpEl(pu, states, duration)).join("");
 
-  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${powerUpEls}${paddle}${ballEls.join("")}</svg>`);
+  return minifySVG(`<svg width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" xmlns="http://www.w3.org/2000/svg"><rect class="bg" width="100%" height="100%"/>${style}${brickSymbol}${brickUses}${powerUpEls}${ballEls.join("")}${paddle}</svg>`);
 }
 
 async function main() {
