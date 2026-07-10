@@ -1,5 +1,6 @@
 import { writeFileSync, mkdirSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { THEMES } from "./themes.mjs";
 
 // Layout
@@ -23,7 +24,7 @@ const STARTING_LIVES = 3;
 const BALL_SPEED = 6;
 const FAST_SPEED = 8.5;
 const SLOW_SPEED = 4.5;
-const SUB_STEPS = 8;
+const SUB_STEPS = 10;
 const SECONDS_PER_FRAME = 1 / 24;
 const FRAME_SAMPLE = 4;
 const MAX_FRAMES = 40000;
@@ -159,7 +160,7 @@ function clampVelocity(vx, vy, speed, biasX = 0) {
   return normalizeVelocity(nvx, nvy, speed);
 }
 
-/** Prevent horizontal-only trajectories after any collision. */
+/** Prevent horizontal-only trajectories after side bounces. */
 function deflatVelocity(vx, vy, speed, preferDown = true) {
   const minVy = speed * MIN_VY_RATIO;
   if (Math.abs(vy) >= minVy * 0.9) return { vx, vy };
@@ -169,87 +170,65 @@ function deflatVelocity(vx, vy, speed, preferDown = true) {
   return clampVelocity(nvx, nvy, speed, vx);
 }
 
-function circleOverlapsRect(cx, cy, r, rx, ry, rw, rh) {
-  const closestX = Math.max(rx, Math.min(cx, rx + rw));
-  const closestY = Math.max(ry, Math.min(cy, ry + rh));
-  const dx = cx - closestX;
-  const dy = cy - closestY;
-  return dx * dx + dy * dy <= r * r;
+function pointInExpandedRect(x, y, rx, ry, rw, rh, r) {
+  return x >= rx - r && x <= rx + rw + r && y >= ry - r && y <= ry + rh + r;
 }
 
 /**
- * Resolve circle-rect overlap by pushing the ball out along the shallowest axis.
- * Only returns a bounce when the ball is moving into the surface.
+ * Fast circle-vs-brick collision using expanded AABB.
  * @returns {{ side: string, x: number, y: number, vx: number, vy: number } | null}
  */
-function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
-  const closestX = Math.max(rx, Math.min(cx, rx + rw));
-  const closestY = Math.max(ry, Math.min(cy, ry + rh));
-  const dx = cx - closestX;
-  const dy = cy - closestY;
-  if (dx * dx + dy * dy > r * r) return null;
+function collideBallBrick(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
+  if (!pointInExpandedRect(cx, cy, rx, ry, rw, rh, r)) return null;
 
-  const overlapLeft = cx + r - rx;
-  const overlapRight = rx + rw - (cx - r);
-  const overlapTop = cy + r - ry;
-  const overlapBottom = ry + rh - (cy - r);
+  const ex = rx - r;
+  const ey = ry - r;
+  const ew = rw + 2 * r;
+  const eh = rh + 2 * r;
 
-  const absVx = Math.abs(vx);
-  const absVy = Math.abs(vy);
+  const dLeft = cx - ex;
+  const dRight = ex + ew - cx;
+  const dTop = cy - ey;
+  const dBottom = ey + eh - cy;
+  const minD = Math.min(dLeft, dRight, dTop, dBottom);
 
+  let side = "top";
   let nx = 0;
   let ny = 0;
-  let side = "top";
-  let x = cx;
-  let y = cy;
+  let outX = cx;
+  let outY = cy;
 
-  // Pick axis by velocity (prevents gutter traps), face by penetration depth
-  if (absVx > absVy * 1.1) {
-    if (overlapLeft < overlapRight) {
-      side = "left"; nx = -1; x = rx - r - 0.01;
-    } else {
-      side = "right"; nx = 1; x = rx + rw + r + 0.01;
-    }
-  } else if (absVy > absVx * 1.1) {
-    if (overlapTop < overlapBottom) {
-      side = "top"; ny = -1; y = ry - r - 0.01;
-    } else {
-      side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
-    }
-  } else if (overlapLeft <= overlapRight && overlapLeft <= overlapTop && overlapLeft <= overlapBottom) {
-    side = "left"; nx = -1; x = rx - r - 0.01;
-  } else if (overlapRight <= overlapTop && overlapRight <= overlapBottom) {
-    side = "right"; nx = 1; x = rx + rw + r + 0.01;
-  } else if (overlapTop <= overlapBottom) {
-    side = "top"; ny = -1; y = ry - r - 0.01;
+  if (minD === dLeft) {
+    side = "left"; nx = -1; outX = ex - 0.01;
+  } else if (minD === dRight) {
+    side = "right"; nx = 1; outX = ex + ew + 0.01;
+  } else if (minD === dTop) {
+    side = "top"; ny = -1; outY = ey - 0.01;
   } else {
-    side = "bottom"; ny = 1; y = ry + rh + r + 0.01;
+    side = "bottom"; ny = 1; outY = ey + eh + 0.01;
   }
 
-  if (vx * nx + vy * ny >= 0) return null;
-
+  const speed = Math.hypot(vx, vy) || BALL_SPEED;
   const dot = vx * nx + vy * ny;
   let rvx = vx - 2 * dot * nx;
   let rvy = vy - 2 * dot * ny;
 
-  // Side bounces must gain vertical component — never slide horizontally
-  if (side === "left" || side === "right") {
-    const speed = Math.hypot(vx, vy) || BALL_SPEED;
-    const flat = deflatVelocity(rvx, rvy, speed, true);
-    rvx = flat.vx;
-    rvy = flat.vy;
+  // Still overlapping but separating on this axis — push out and reflect anyway
+  if (dot >= 0) {
+    if (side === "left" || side === "right") {
+      rvx = -Math.abs(rvx || vx || speed * MIN_VX_RATIO);
+    } else {
+      rvy = -Math.abs(rvy || vy || speed * MIN_VY_RATIO);
+    }
   }
 
-  return { side, x, y, vx: rvx, vy: rvy };
-}
+  if (side === "left" || side === "right") {
+    ({ vx: rvx, vy: rvy } = deflatVelocity(rvx, rvy, speed, true));
+  } else {
+    ({ vx: rvx, vy: rvy } = clampVelocity(rvx, rvy, speed, vx));
+  }
 
-/**
- * Only collide on first contact this step — not while already resting inside.
- */
-function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
-  if (!circleOverlapsRect(cx, cy, r, rx, ry, rw, rh)) return null;
-  if (circleOverlapsRect(px, py, r, rx, ry, rw, rh)) return null;
-  return resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy);
+  return { side, x: outX, y: outY, vx: rvx, vy: rvy };
 }
 
 /**
@@ -295,6 +274,15 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   }];
 
   const simulatedBricks = bricks.map((b, i) => ({ ...b, index: i }));
+  const brickCell = BRICK_SIZE + BRICK_GAP;
+  const brickCols = Math.max(...simulatedBricks.map((b) => Math.round((b.x - PADDING) / brickCell)), 0) + 1;
+  /** @type {(typeof simulatedBricks[0] | null)[][]} */
+  const brickGrid = Array.from({ length: brickCols }, () => Array(7).fill(null));
+  for (const b of simulatedBricks) {
+    const c = Math.round((b.x - PADDING) / brickCell);
+    const r = Math.round((b.y - HUD_HEIGHT - PADDING) / brickCell);
+    if (c >= 0 && c < brickCols && r >= 0 && r < 7) brickGrid[c][r] = b;
+  }
   /** @type {FrameState[]} */
   const frameHistory = [];
   /** @type {PowerUp[]} */
@@ -315,10 +303,11 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   let xpSpawned = false;
 
   const breakable = (/** @type {Brick} */ b) =>
-    b.status === "visible" && (!enableGhostBricks || b.hasCommit);
+    b.status === "visible" && b.hasCommit;
 
+  // Only contribution bricks are solid — ghost days are pass-through by design
   const collidable = (/** @type {Brick} */ b) =>
-    enableGhostBricks ? b.status === "visible" && b.hasCommit : b.status === "visible";
+    b.status === "visible" && b.hasCommit;
 
   const getBallSpeed = (/** @type {Ball} */ ball) => {
     if (speedMod.type === "fast" && frame < speedMod.until) return FAST_SPEED;
@@ -538,22 +527,41 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ball.y = Infinity;
         }
 
-        // Brick collisions — first contact only, closest brick wins
-        let bestHit = /** @type {{ i: number, dist: number, hit: NonNullable<ReturnType<typeof resolveCircleRect>> } | null} */ (null);
+        // Brick collisions — swept AABB with nearby-brick culling
+        const reach = BALL_RADIUS + Math.abs(stepVx) + Math.abs(stepVy) + 2;
+        const qMinX = Math.min(prevX, ball.x) - reach;
+        const qMaxX = Math.max(prevX, ball.x) + reach;
+        const qMinY = Math.min(prevY, ball.y) - reach;
+        const qMaxY = Math.max(prevY, ball.y) + reach;
 
-        for (let i = 0; i < simulatedBricks.length; i++) {
-          const brick = simulatedBricks[i];
-          if (!collidable(brick)) continue;
+        let bestHit = /** @type {{ i: number, dist: number, hit: NonNullable<ReturnType<typeof collideBallBrick>> } | null} */ (null);
 
-          const hit = newCircleRectHit(
-            prevX, prevY, ball.x, ball.y, BALL_RADIUS,
-            brick.x, brick.y, BRICK_SIZE, BRICK_SIZE,
-            ball.vx, ball.vy,
-          );
-          if (!hit) continue;
+        const c0 = Math.max(0, Math.floor((qMinX - PADDING) / brickCell));
+        const c1 = Math.min(brickCols - 1, Math.floor((qMaxX - PADDING) / brickCell));
+        const r0 = Math.max(0, Math.floor((qMinY - HUD_HEIGHT - PADDING) / brickCell));
+        const r1 = Math.min(6, Math.floor((qMaxY - HUD_HEIGHT - PADDING) / brickCell));
 
-          const dist = (brick.x + BRICK_SIZE / 2 - prevX) ** 2 + (brick.y + BRICK_SIZE / 2 - prevY) ** 2;
-          if (!bestHit || dist < bestHit.dist) bestHit = { i, dist, hit };
+        for (let c = c0; c <= c1; c++) {
+          for (let r = r0; r <= r1; r++) {
+            const brick = brickGrid[c][r];
+            if (!brick || !collidable(brick)) continue;
+            if (
+              brick.x + BRICK_SIZE < qMinX ||
+              brick.x > qMaxX ||
+              brick.y + BRICK_SIZE < qMinY ||
+              brick.y > qMaxY
+            ) continue;
+
+            const hit = collideBallBrick(
+              prevX, prevY, ball.x, ball.y, BALL_RADIUS,
+              brick.x, brick.y, BRICK_SIZE, BRICK_SIZE,
+              ball.vx, ball.vy,
+            );
+            if (!hit) continue;
+
+            const dist = (brick.x + BRICK_SIZE / 2 - prevX) ** 2 + (brick.y + BRICK_SIZE / 2 - prevY) ** 2;
+            if (!bestHit || dist < bestHit.dist) bestHit = { i: brick.index, dist, hit };
+          }
         }
 
         if (bestHit) {
@@ -562,15 +570,12 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           ball.y = bestHit.hit.y;
           ball.vx = bestHit.hit.vx;
           ball.vy = bestHit.hit.vy;
-          const cv = clampVelocity(
-            ball.vx, ball.vy, speed, ball.x - (brick.x + BRICK_SIZE / 2),
-          );
-          ({ vx: ball.vx, vy: ball.vy } = deflatVelocity(
-            cv.vx, cv.vy, speed, bestHit.hit.side !== "top",
-          ));
 
           if (breakable(brick)) {
             brick.status = "hidden";
+            const bc = Math.round((brick.x - PADDING) / brickCell);
+            const br = Math.round((brick.y - HUD_HEIGHT - PADDING) / brickCell);
+            if (bc >= 0 && bc < brickCols && br >= 0 && br < 7) brickGrid[bc][br] = null;
             score += brickPoints(brick.contributionCount, brick.level);
             spawnPowerUp(brick);
             recordExtra = true;
@@ -582,11 +587,6 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           const maxY = horizOnPaddle ? paddleContactY : paddleBottom;
           ball.y = Math.max(topBound, Math.min(maxY, ball.y));
         }
-
-        // Safety net: never allow a purely horizontal trajectory
-        const flat = deflatVelocity(ball.vx, ball.vy, speed, ball.y < paddleY);
-        ball.vx = flat.vx;
-        ball.vy = flat.vy;
       }
 
       // Fall power-ups
@@ -1013,7 +1013,9 @@ async function main() {
   console.log(`Done! Generated ${Object.keys(THEMES).length * 2} themed SVGs.`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
