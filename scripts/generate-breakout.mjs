@@ -20,7 +20,7 @@ const POWERUP_FALL_SPEED = 2.2;
 const BALL_SPEED = 8;
 const FAST_SPEED = 11;
 const SLOW_SPEED = 6;
-const SUB_STEPS = 6;
+const SUB_STEPS = 8;
 const SECONDS_PER_FRAME = 1 / 30;
 const FRAME_SAMPLE = 4;
 const MAX_FRAMES = 40000;
@@ -128,33 +128,73 @@ function clampVelocity(vx, vy, speed, biasX = 0) {
   return normalizeVelocity(nvx, nvy, speed);
 }
 
-function circleRectCollisionSide(cx, cy, r, rx, ry, rw, rh, prevCx, prevCy) {
+function circleOverlapsRect(cx, cy, r, rx, ry, rw, rh) {
+  const closestX = Math.max(rx, Math.min(cx, rx + rw));
+  const closestY = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  return dx * dx + dy * dy <= r * r;
+}
+
+/**
+ * Resolve circle-rect overlap by pushing the ball out along the shallowest axis.
+ * Only returns a bounce when the ball is moving into the surface.
+ * @returns {{ side: string, x: number, y: number, vx: number, vy: number } | null}
+ */
+function resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy) {
   const closestX = Math.max(rx, Math.min(cx, rx + rw));
   const closestY = Math.max(ry, Math.min(cy, ry + rh));
   const dx = cx - closestX;
   const dy = cy - closestY;
   if (dx * dx + dy * dy > r * r) return null;
 
-  const wasLeft = prevCx + r <= rx;
-  const wasRight = prevCx - r >= rx + rw;
-  const wasAbove = prevCy + r <= ry;
-  const wasBelow = prevCy - r >= ry + rh;
-
   const overlapLeft = cx + r - rx;
   const overlapRight = rx + rw - (cx - r);
   const overlapTop = cy + r - ry;
   const overlapBottom = ry + rh - (cy - r);
-
-  if (wasAbove && overlapTop < overlapBottom) return "top";
-  if (wasBelow && overlapBottom < overlapTop) return "bottom";
-  if (wasLeft && overlapLeft < overlapRight) return "left";
-  if (wasRight && overlapRight < overlapLeft) return "right";
-
   const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
-  if (minOverlap === overlapTop) return "top";
-  if (minOverlap === overlapBottom) return "bottom";
-  if (minOverlap === overlapLeft) return "left";
-  return "right";
+
+  let nx = 0;
+  let ny = 0;
+  let side = "top";
+  let x = cx;
+  let y = cy;
+
+  if (minOverlap === overlapLeft) {
+    side = "left";
+    nx = -1;
+    x = rx - r - 0.01;
+  } else if (minOverlap === overlapRight) {
+    side = "right";
+    nx = 1;
+    x = rx + rw + r + 0.01;
+  } else if (minOverlap === overlapTop) {
+    side = "top";
+    ny = -1;
+    y = ry - r - 0.01;
+  } else {
+    side = "bottom";
+    ny = 1;
+    y = ry + rh + r + 0.01;
+  }
+
+  // Ignore if already separating from this surface
+  if (vx * nx + vy * ny >= 0) return null;
+
+  const dot = vx * nx + vy * ny;
+  const rvx = vx - 2 * dot * nx;
+  const rvy = vy - 2 * dot * ny;
+
+  return { side, x, y, vx: rvx, vy: rvy };
+}
+
+/**
+ * Only collide on first contact this step — not while already resting inside.
+ */
+function newCircleRectHit(px, py, cx, cy, r, rx, ry, rw, rh, vx, vy) {
+  if (!circleOverlapsRect(cx, cy, r, rx, ry, rw, rh)) return null;
+  if (circleOverlapsRect(px, py, r, rx, ry, rw, rh)) return null;
+  return resolveCircleRect(cx, cy, r, rx, ry, rw, rh, vx, vy);
 }
 
 /**
@@ -194,11 +234,13 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
   let wideUntil = 0;
   let speedMod = /** @type {{ type: 'fast'|'slow'|null, until: number }} */ ({ type: null, until: 0 });
   let frame = 0;
-  let verticalTrapFrames = 0;
   let brokenCount = 0;
 
   const breakable = (/** @type {Brick} */ b) =>
     b.status === "visible" && (!enableGhostBricks || b.hasCommit);
+
+  const collidable = (/** @type {Brick} */ b) =>
+    enableGhostBricks ? b.status === "visible" && b.hasCommit : b.status === "visible";
 
   const getBallSpeed = (/** @type {Ball} */ ball) => {
     if (speedMod.type === "fast" && frame < speedMod.until) return FAST_SPEED;
@@ -281,26 +323,34 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
         ball.x += stepVx;
         ball.y += stepVy;
 
-        if (ball.x - BALL_RADIUS < PADDING) {
+        // Wall collisions — only when crossing boundary this sub-step
+        if (ball.x - BALL_RADIUS < PADDING && prevX - BALL_RADIUS >= PADDING) {
           ball.x = PADDING + BALL_RADIUS;
           ball.vx = Math.abs(ball.vx);
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, 1));
-        } else if (ball.x + BALL_RADIUS > canvasWidth - PADDING) {
+        } else if (ball.x + BALL_RADIUS > canvasWidth - PADDING && prevX + BALL_RADIUS <= canvasWidth - PADDING) {
           ball.x = canvasWidth - PADDING - BALL_RADIUS;
           ball.vx = -Math.abs(ball.vx);
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, -1));
         }
 
-        if (ball.y - BALL_RADIUS < PADDING) {
+        if (ball.y - BALL_RADIUS < PADDING && prevY - BALL_RADIUS >= PADDING) {
           ball.y = PADDING + BALL_RADIUS;
           ball.vy = Math.abs(ball.vy);
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - canvasWidth / 2));
         }
 
-        if (
+        // Paddle — must cross top edge while moving down
+        const prevBottom = prevY + BALL_RADIUS;
+        const currBottom = ball.y + BALL_RADIUS;
+        const crossedPaddle =
           ball.vy > 0 &&
-          circleRectCollisionSide(ball.x, ball.y, BALL_RADIUS, paddleX, paddleY, paddleWidth, PADDLE_HEIGHT, prevX, prevY)
-        ) {
+          prevBottom <= paddleY &&
+          currBottom >= paddleY &&
+          ball.x + BALL_RADIUS > paddleX &&
+          ball.x - BALL_RADIUS < paddleX + paddleWidth;
+
+        if (crossedPaddle) {
           const hitPos = Math.max(0.05, Math.min(0.95, (ball.x - paddleX) / paddleWidth));
           const maxDeflection = Math.PI * 0.4;
           let angle = (hitPos - 0.5) * maxDeflection * 2;
@@ -309,29 +359,40 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
           }
           ball.vx = speed * Math.sin(angle);
           ball.vy = -speed * Math.cos(angle);
-          ball.y = paddleY - BALL_RADIUS - 0.5;
+          ball.y = paddleY - BALL_RADIUS - 0.01;
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - paddleX - paddleWidth / 2));
         }
 
+        // Brick collisions — first contact only, closest brick wins
+        let bestHit = /** @type {{ i: number, dist: number, hit: NonNullable<ReturnType<typeof resolveCircleRect>> } | null} */ (null);
+
         for (let i = 0; i < simulatedBricks.length; i++) {
           const brick = simulatedBricks[i];
-          if (!breakable(brick)) continue;
+          if (!collidable(brick)) continue;
 
-          const side = circleRectCollisionSide(ball.x, ball.y, BALL_RADIUS, brick.x, brick.y, BRICK_SIZE, BRICK_SIZE, prevX, prevY);
-          if (!side) continue;
+          const hit = newCircleRectHit(
+            prevX, prevY, ball.x, ball.y, BALL_RADIUS,
+            brick.x, brick.y, BRICK_SIZE, BRICK_SIZE,
+            ball.vx, ball.vy,
+          );
+          if (!hit) continue;
 
-          if (side === "top" || side === "bottom") {
-            ball.vy = -ball.vy;
-            ball.y = side === "top" ? brick.y - BALL_RADIUS - 0.5 : brick.y + BRICK_SIZE + BALL_RADIUS + 0.5;
-          } else {
-            ball.vx = -ball.vx;
-            ball.x = side === "left" ? brick.x - BALL_RADIUS - 0.5 : brick.x + BRICK_SIZE + BALL_RADIUS + 0.5;
-          }
+          const dist = (brick.x + BRICK_SIZE / 2 - prevX) ** 2 + (brick.y + BRICK_SIZE / 2 - prevY) ** 2;
+          if (!bestHit || dist < bestHit.dist) bestHit = { i, dist, hit };
+        }
 
-          brick.status = "hidden";
-          spawnPowerUp(brick);
+        if (bestHit) {
+          const brick = simulatedBricks[bestHit.i];
+          ball.x = bestHit.hit.x;
+          ball.y = bestHit.hit.y;
+          ball.vx = bestHit.hit.vx;
+          ball.vy = bestHit.hit.vy;
           ({ vx: ball.vx, vy: ball.vy } = clampVelocity(ball.vx, ball.vy, speed, ball.x - (brick.x + BRICK_SIZE / 2)));
-          break;
+
+          if (breakable(brick)) {
+            brick.status = "hidden";
+            spawnPowerUp(brick);
+          }
         }
 
         ball.x = Math.max(PADDING + BALL_RADIUS, Math.min(canvasWidth - PADDING - BALL_RADIUS, ball.x));
@@ -358,19 +419,6 @@ function simulate(bricks, canvasWidth, canvasHeight, paddleY, enableGhostBricks,
     }
 
     if (balls.length === 0) respawnBall();
-
-    const primary = balls[0];
-    if (primary && Math.abs(primary.vx) < BALL_SPEED * MIN_VX_RATIO * 1.1) {
-      verticalTrapFrames++;
-      if (verticalTrapFrames > 30) {
-        const nudge = verticalTrapFrames % 2 === 0 ? 1 : -1;
-        const speed = getBallSpeed(primary);
-        ({ vx: primary.vx, vy: primary.vy } = clampVelocity(nudge * speed * MIN_VX_RATIO, primary.vy, speed, nudge));
-        verticalTrapFrames = 0;
-      }
-    } else {
-      verticalTrapFrames = 0;
-    }
 
     if (frame % FRAME_SAMPLE === 0) {
       frameHistory.push({
